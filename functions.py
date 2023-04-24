@@ -1,10 +1,11 @@
 #!/home/edd1e/scripts/projs/uts_bot/uts_bot_env/bin/python3
 import configuration as conf
 import driver
+import helpers
 
-import getpass
 from time import sleep
 import os
+import logging
 
 
 
@@ -12,7 +13,11 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from dotenv import load_dotenv
 load_dotenv()
-
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s [%(levelname)s|%(name)s|%(funcName)s]:: %(message)s', 
+    handlers=[logging.StreamHandler()]
+)
 class Get_Saia_Data:
 
 
@@ -28,7 +33,6 @@ class Get_Saia_Data:
 
         #Enter login button
         self.driver.click_button(self.driver.find_inner_element(By.CLASS_NAME, "login-identityprovider-btn"))
-        sleep(1)
         
         #Type in login and password data
         self.driver.type_data("loginfmt", "passwd", self.email, self.passwd)
@@ -39,15 +43,13 @@ class Get_Saia_Data:
         #Click on 'Courses' button 
         self.driver.click_button(self.driver.find_inner_element(By.CLASS_NAME,'primary-navigation').find_elements(By.TAG_NAME, "li")[2].find_element(By.TAG_NAME, 'a'))
         
-        sleep(1)
         courses = self.driver.find_inner_element(By.CLASS_NAME,"dashboard-card-deck").find_elements(By.CLASS_NAME,"dashboard-card")
         
         #Now for every course on dashboard, it will click it and enter it 
         for element in courses:
-            self.driver.click_button(element.find_element(By.TAG_NAME, "a"))
-            sleep(2)
+            get_activities_helper = helpers.Helpers(self.driver)
+            get_activities_helper.get_saia_activities(element)
             self.driver.go_back()
-            sleep(.5)
 
 
 if __name__ == "__main__":

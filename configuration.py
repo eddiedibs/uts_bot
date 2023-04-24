@@ -22,4 +22,4 @@ CHROME_DRIVER_DIR = str(BASE_DIR) + "/chromedriver"
 saia_page = "https://saia2.uts.edu.ve/"
 login_btn = "login-identityprovider-btn"
 
-
+UNDESIRED_ACTIVITIES = ["RECURSO", "PÁGINA", "URL"]
