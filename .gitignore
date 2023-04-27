@@ -2,3 +2,6 @@
 __pycache__/
 .env
 .vscode/
+*xlsx
+*xlsx#
+test.py

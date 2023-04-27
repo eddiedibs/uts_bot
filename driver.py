@@ -11,7 +11,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import NoSuchElementException, StaleElementReferenceException,WebDriverException
+from selenium.common.exceptions import NoSuchElementException, StaleElementReferenceException,WebDriverException, TimeoutException, NoSuchElementException
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -38,6 +38,7 @@ class Browser:
         self.browser.get(url)
 
     def click_button(self, element:object):
+        previous_url = self.browser.current_url
         try:
             element_to_string = Browser.get_attribute(element)
             logging.info(f"CLICKING ON ELEMENT:: {element_to_string}")
@@ -46,17 +47,35 @@ class Browser:
         except StaleElementReferenceException:
             logging.warning(f"StaleElementReferenceException, ELEMENT {element}, was not found")
             return False
+        except WebDriverException as webExp:
+            logging.warning(f"ERROR:: {webExp}")
+            sleep(5) # Wait for some time
+            if self.browser.current_url == previous_url:
+                self.browser.refresh() # Refresh the page
+                logging.warning("TRYING AGAIN... CLICKING ON ELEMENT:: ", {element_to_string})
+                element.click()
 
-    def find_inner_element(self,by_param:str, element:str, is_single_element=True):
-        # if element == "section course-section":
-        #     return self.browser.find_element(by_param, element)
+    def find_inner_element(self,by_param:str, element:str, is_single_element=True, wait_for_element=True):
+        try:
+            if wait_for_element and is_single_element:
+                self.wait.until(EC.presence_of_element_located((by_param, element)))
+                return self.browser.find_element(by_param, element)
+            
+            elif wait_for_element and not is_single_element:
+                self.wait.until(EC.presence_of_element_located((by_param, element)))
+                return self.browser.find_elements(by_param, element)
 
-        self.wait.until(EC.presence_of_element_located((by_param, element)))
-        if is_single_element:
-            return self.browser.find_element(by_param, element)
-        else:
-            return self.browser.find_elements(by_param, element)
+            elif not wait_for_element:
+                element_to_return = self.browser.find_element(by_param, element)
+                return element_to_return
+            
+        except TimeoutException as timeExp:
+            logging.error(f"ERROR:: {timeExp}")
+        
+        except NoSuchElementException:
+            return None
 
+        
     @classmethod
     def get_attribute(cls, element:object):
         try:
@@ -88,9 +107,8 @@ class Browser:
             sleep(5) # Wait for some time
             if self.browser.current_url == previous_url:
                 self.browser.refresh() # Refresh the page
+                logging.warning("TRYING AGAIN... GOING TO PREVIOUS PAGE")
                 self.browser.back() # Try navigating back again
-            logging.warning("TRYING AGAIN... GOING TO PREVIOUS PAGE")
-            self.browser.back()
 
 
     def close_browser(self):
