@@ -1,4 +1,4 @@
-#!/home/edd1e/scripts/projs/uts_bot/uts_bot_env/bin/python3
+#!/home/edd1e/scripts/projs/other/uts_bot/uts_bot_env/bin/python3
 
 import configuration as conf
 from time import sleep
@@ -120,7 +120,7 @@ class Browser:
 if __name__ == "__main__":
 
     browser = Browser(conf.CHROME_DRIVER_DIR)
-    browser.open_page(conf.saia_page)
+    browser.open_page(conf.target_page)
     browser.click_button(browser.find_inner_element(By.CLASS_NAME, "login-identityprovider-btn"))
     browser.type_data("loginfmt", "passwd")
     browser.click_button(browser.find_inner_element(By.ID,"idBtn_Back"))

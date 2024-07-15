@@ -1,4 +1,4 @@
-#!/home/edd1e/scripts/projs/uts_bot/uts_bot_env/bin/python3
+#!/home/edd1e/scripts/projs/other/uts_bot/uts_bot_env/bin/python3
 
 
 

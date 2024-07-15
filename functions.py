@@ -1,4 +1,4 @@
-#!/home/edd1e/scripts/projs/uts_bot/uts_bot_env/bin/python3
+#!/home/edd1e/scripts/projs/other/uts_bot/uts_bot_env/bin/python3
 import configuration as conf
 import driver
 import helpers
@@ -18,7 +18,7 @@ logging.basicConfig(
     format='%(asctime)s [%(levelname)s|%(name)s|%(funcName)s]:: %(message)s', 
     handlers=[logging.StreamHandler()]
 )
-class Get_Saia_Data:
+class GetPageData:
 
 
     def __init__(self, email, passwd):
@@ -29,7 +29,7 @@ class Get_Saia_Data:
 
     def get_courses_deadlines(self):
         #Enter saia page
-        self.driver.open_page(conf.saia_page)
+        self.driver.open_page(conf.target_page)
 
         #Enter login button
         self.driver.click_button(self.driver.find_inner_element(By.CLASS_NAME, "login-identityprovider-btn"))
@@ -55,5 +55,5 @@ class Get_Saia_Data:
 if __name__ == "__main__":
     email = os.getenv('EMAIL')
     password = os.getenv('PASSWD')
-    browser = Get_Saia_Data(email,password)
+    browser = GetPageData(email,password)
     browser.get_courses_deadlines()

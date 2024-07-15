@@ -1,4 +1,4 @@
-#!/home/edd1e/scripts/projs/uts_bot/uts_bot_env/bin/python3
+#!/home/edd1e/scripts/projs/other/uts_bot/uts_bot_env/bin/python3
 import configuration as conf
 
 from time import sleep
@@ -106,7 +106,7 @@ class Helpers:
                     font_size = cell.font.size
                     height = (font_size * 1.2) * lines  # assuming line height is 20% larger than font size
                     sheet.row_dimensions[cell.row].height = height
-                    sheet.column_dimensions[cell.column_letter].width = len(str(cell.value))
+                    sheet.column_dimensions[cell.column_letter].width = 70
                     break
 
 
@@ -150,6 +150,19 @@ class Helpers:
             # wb.save(f'{year}_Calendar.xlsx')
 
 
+
+    def break_word(self, text):
+        words = text.split()
+        new_text = ""
+        line_len = 0
+        for word in words:
+            if line_len + len(word) + 1 > 41:
+                new_text += "\n"
+                line_len = 0
+            new_text += word + " "
+            line_len += len(word) + 1
+        return new_text
+
     def find_activity(self, i:int, course_sections:list):
         activities_len = len(course_sections[i].find_elements(By.CLASS_NAME, "aalink.stretched-link"))
         for index in range(activities_len):
@@ -164,17 +177,18 @@ class Helpers:
                 activity_found = self.driver.click_button(activities[index])
                 if activity_found:
 
-                    description = self.driver.find_inner_element(By.CLASS_NAME,"description-inner", wait_for_element=False)
-                    if description != None:
-                        item_to_remove = self.driver.find_inner_element(By.CLASS_NAME,"description-inner").find_elements(By.TAG_NAME, "div")[-1].find_element(By.TAG_NAME, "strong").text.strip()
-                        activity_header = self.driver.find_inner_element(By.CLASS_NAME,"page-header-headings").text.strip().replace("\n", " ")
-                        subject_title = self.driver.find_inner_element(By.CLASS_NAME,"breadcrumb-item").find_element(By.TAG_NAME, "a").text.strip()
-                        if item_to_remove in description.text.strip():
-                            description_text = description.find_elements(By.TAG_NAME, "div")[-1].text.strip()
-                            new_description_text = description_text[len(f"{item_to_remove} "):]
-                            logging.info(f"\n\nSubject:: {subject_title}\nActivity name:: {activity_header}\nScheduled for:: {new_description_text}\n\n")
+                    activity_date = self.driver.find_inner_element(By.CLASS_NAME,"description-inner", wait_for_element=False)
+                    if activity_date != None:
+                        item_to_remove = self.driver.find_inner_element(By.CLASS_NAME,"description-inner", wait_for_element=True).find_elements(By.TAG_NAME, "div")[-1].find_element(By.TAG_NAME, "strong").text.strip()
+                        activity_description = self.driver.find_inner_element(By.CLASS_NAME,"page-header-headings", wait_for_element=True).text.strip().replace("\n", " ")
+                        subject_title = self.driver.find_inner_element(By.CLASS_NAME,"breadcrumb-item", wait_for_element=True).find_element(By.TAG_NAME, "a").text.strip()
+                        if item_to_remove in activity_date.text.strip():
+                            activity_date_text = activity_date.find_elements(By.TAG_NAME, "div")[-1].text.strip()
+                            new_activity_date = activity_date_text[len(f"{item_to_remove} "):]
+                            cleaned_activity_description = self.break_word(activity_description)
+                            logging.info(f"\n\nSubject:: {subject_title}\nActivity name:: {activity_description}\nScheduled for:: {new_activity_date}\n\n")
                             logging.info(f"Writing to file...")
-                            self.write_data_to_excel(new_description_text, f"\n\n{subject_title}::{activity_header}\n")
+                            self.write_data_to_excel(new_activity_date, f"\n\n{subject_title}::{cleaned_activity_description}\n")
                             sleep(1)
                             self.driver.go_back()
                     else:
