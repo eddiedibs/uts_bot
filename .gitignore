@@ -1,7 +1,11 @@
-/uts_bot_env
+/venv
 __pycache__/
 .env
 .vscode/
 *xlsx
 *xlsx#
 test.py
+
+# Go
+/uts_bot
+go.sum
