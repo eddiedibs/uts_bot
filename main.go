@@ -1,13 +1,14 @@
 package main
 
 import (
+	"database/sql"
 	"log/slog"
 	"os"
 
-	"uts_bot/internal/browser"
+	"uts_bot/internal/api"
 	"uts_bot/internal/config"
-	"uts_bot/internal/jobs"
-	"uts_bot/internal/saia"
+
+	_ "github.com/go-sql-driver/mysql"
 )
 
 func main() {
@@ -17,24 +18,26 @@ func main() {
 
 	// .env is loaded in internal/config init (before main runs).
 
-	b := browser.New()
-	defer b.Close()
-
-	switch os.Getenv("BOT_MODE") {
-	case "jobs":
-		j := jobs.New(b)
-		if err := j.GetJobPostings(); err != nil {
-			slog.Error("jobs bot failed", "err", err)
-			os.Exit(1)
-		}
-	case "saia":
-		s := saia.New(b)
-		if err := s.Run(config.SAIAPage); err != nil {
-			slog.Error("saia bot failed", "err", err)
-			os.Exit(1)
-		}
-	default:
-		slog.Error("set BOT_MODE=jobs|saia")
+	if config.DatabaseDSN == "" {
+		slog.Error("set DATABASE_DSN (MySQL DSN)")
+		os.Exit(1)
+	}
+	if config.APIKey == "" {
+		slog.Error("set API_KEY (shared secret for clients)")
+		os.Exit(1)
+	}
+	db, err := sql.Open("mysql", config.DatabaseDSN)
+	if err != nil {
+		slog.Error("open database", "err", err)
+		os.Exit(1)
+	}
+	defer db.Close()
+	if err := db.Ping(); err != nil {
+		slog.Error("database ping", "err", err)
+		os.Exit(1)
+	}
+	if err := api.Run(db, config.APIKey); err != nil {
+		slog.Error("api server", "err", err)
 		os.Exit(1)
 	}
 }

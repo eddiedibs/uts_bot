@@ -16,15 +16,21 @@ var (
 	ChromeBin string
 	// BrowserDebug: true = visible Chrome window; false/unset = headless (chromedp default).
 	BrowserDebug bool
-	TargetPage   string
+	// ChromeNoSandbox adds --no-sandbox and --disable-dev-shm-usage (needed for Chromium in Docker).
+	ChromeNoSandbox bool
 	SAIAPage     string
 	LoginBtn     = "loginbtn"
 	UndesiredActivities = []string{"RECURSO", "PÁGINA", "URL"}
 	Username     string
 	Password     string
-	APIBaseURL   string
 	// CourseViewBaseURL is the Moodle course page without query string, e.g. …/course/view.php
 	CourseViewBaseURL string
+	// DatabaseDSN is a MySQL DSN, e.g. user:pass@tcp(127.0.0.1:3306)/uft_db?parseTime=true
+	DatabaseDSN string
+	// APIListenAddr is the HTTP listen address (e.g. :8080).
+	APIListenAddr string
+	// APIKey is the shared secret for clients (send via X-API-Key or Authorization: Bearer). Set API_KEY in .env.
+	APIKey string
 )
 
 func init() {
@@ -34,12 +40,14 @@ func init() {
 
 	ChromeBin = getEnvOr("CHROME_BIN", "")
 	BrowserDebug = envBool("BROWSER_DEBUG", false)
-	TargetPage = getEnvOr("TARGET_PAGE", "https://getonbrd.com/")
+	ChromeNoSandbox = envBool("CHROME_NO_SANDBOX", false)
 	SAIAPage = getEnvOr("SAIA_PAGE", "https://saia.uft.edu.ve/")
 	Username = os.Getenv("UTS_USERNAME")
 	Password = os.Getenv("UTS_PASSWORD")
-	APIBaseURL = getEnvOr("API_BASE_URL", "http://127.0.0.1:8000")
 	CourseViewBaseURL = strings.TrimSuffix(getEnvOr("COURSE_VIEW_BASE_URL", "https://saia.uft.edu.ve/course/view.php"), "?")
+	DatabaseDSN = os.Getenv("DATABASE_DSN")
+	APIListenAddr = getEnvOr("API_LISTEN", ":8080")
+	APIKey = strings.TrimSpace(os.Getenv("API_KEY"))
 }
 
 func getEnvOr(key, fallback string) string {

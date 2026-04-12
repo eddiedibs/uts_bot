@@ -47,6 +47,13 @@ func New() *Browser {
 			chromedp.Flag("mute-audio", false),
 		)
 	}
+	if config.ChromeNoSandbox {
+		opts = append(opts,
+			chromedp.Flag("no-sandbox", true),
+			chromedp.Flag("disable-dev-shm-usage", true),
+			chromedp.Flag("disable-gpu", true),
+		)
+	}
 	if config.ChromeBin != "" {
 		opts = append(opts, chromedp.ExecPath(config.ChromeBin))
 	}

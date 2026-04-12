@@ -1,0 +1,48 @@
+# UTS bot API + MySQL
+#
+# 1. Copy .env and set at least: API_KEY, UTS_USERNAME, UTS_PASSWORD
+# 2. For Compose, point MySQL at the db service (host name "db"), e.g.:
+#    DATABASE_DSN=uts:yourpass@tcp(db:3306)/uft_db?parseTime=true&charset=utf8mb4
+#    (match MYSQL_USER / MYSQL_PASSWORD below)
+# 3. Run migrations once the db is up (see README or mysql client).
+# 4. docker compose up --build
+
+services:
+  db:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-uts_root_change_me}
+      MYSQL_DATABASE: uft_db
+      MYSQL_USER: ${MYSQL_USER:-uts}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-uts_pass_change_me}
+    command: >
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - mysql_data:/var/lib/mysql
+    ports:
+      - "${MYSQL_PUBLISH_PORT:-3306}:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+      start_period: 25s
+
+  api:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-8080}:8080"
+    env_file:
+      - .env
+    environment:
+      CHROME_BIN: /usr/bin/chromium
+      CHROME_NO_SANDBOX: "true"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  mysql_data:
