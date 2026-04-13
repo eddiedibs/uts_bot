@@ -54,10 +54,14 @@ func New() *Browser {
 		)
 	}
 	if config.ChromeNoSandbox {
+		// Container / browserless-style Chromium: sandbox off, no zygote, single process,
+		// small /dev/shm friendly flags (see chromedp.NoSandbox, chromedp.DisableGPU).
 		opts = append(opts,
-			chromedp.Flag("no-sandbox", true),
+			chromedp.NoSandbox,
+			chromedp.DisableGPU,
 			chromedp.Flag("disable-dev-shm-usage", true),
-			chromedp.Flag("disable-gpu", true),
+			chromedp.Flag("no-zygote", true),
+			chromedp.Flag("single-process", true),
 		)
 	}
 	if config.ChromeBin != "" {
