@@ -2,7 +2,7 @@
 #
 # 1. cp .env.example .env  → set API_KEY, UTS_USERNAME, UTS_PASSWORD (and DB passwords if you change defaults)
 # 2. DATABASE_DSN must use host "db" and match MYSQL_USER / MYSQL_PASSWORD when running in Compose
-# 3. docker compose up --build
+# 3. docker compose up --build -d   (note: "docker compose", not "docker-compose" unless you use the legacy binary)
 #    (migrations run automatically before the API starts)
 #
 # See README.md for manual migrate / troubleshooting.

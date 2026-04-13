@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -64,8 +66,19 @@ func New() *Browser {
 			chromedp.Flag("single-process", true),
 		)
 	}
-	if config.ChromeBin != "" {
+	switch {
+	case config.ChromeBin != "":
+		logIfSnapChromiumExec("CHROME_BIN", config.ChromeBin)
 		opts = append(opts, chromedp.ExecPath(config.ChromeBin))
+	case config.ChromeNoSandbox:
+		// Snap's "chromium" wrapper fails under restricted users (www-data) or tight
+		// /run permissions; prefer a packaged .deb / Google Chrome binary when unset.
+		if p := preferPackagedChromiumExecPath(); p != "" {
+			slog.Info("chromium exec path", "path", p, "note", "non-snap packaged binary (CHROME_NO_SANDBOX, CHROME_BIN unset)")
+			opts = append(opts, chromedp.ExecPath(p))
+		} else {
+			slog.Info("no packaged non-snap Chrome/Chromium in standard paths; chromedp uses PATH — set CHROME_BIN if launch fails (avoid snap)")
+		}
 	}
 	allocCtx, _ := chromedp.NewExecAllocator(context.Background(), opts...)
 	ctx, cancel := chromedp.NewContext(allocCtx)
@@ -345,6 +358,52 @@ func (b *Browser) CollectLinksInActivityNameDivs() ([]ActivityNameLink, error) {
 		out = []ActivityNameLink{}
 	}
 	return out, nil
+}
+
+func resolvedExecPath(p string) string {
+	r, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		return p
+	}
+	return r
+}
+
+func pathLooksLikeSnap(p string) bool {
+	return strings.Contains(p, "/snap/")
+}
+
+func logIfSnapChromiumExec(source, p string) {
+	r := resolvedExecPath(p)
+	if !pathLooksLikeSnap(r) {
+		return
+	}
+	slog.Info("chrome binary resolves to snap; headless runs often fail (snap home, XDG_RUNTIME_DIR). Use a .deb Chromium or Google Chrome and set CHROME_BIN",
+		"source", source, "path", p, "resolved", r)
+}
+
+// preferPackagedChromiumExecPath returns a non-snap Chrome/Chromium binary if one exists.
+func preferPackagedChromiumExecPath() string {
+	candidates := []string{
+		"/usr/bin/google-chrome-stable",
+		"/usr/bin/google-chrome",
+		"/opt/google/chrome/chrome",
+		"/usr/bin/chromium",
+		"/usr/bin/chromium-browser",
+		"/usr/lib/chromium/chromium",
+		"/usr/lib/chromium-browser/chromium-browser",
+	}
+	for _, p := range candidates {
+		res := resolvedExecPath(p)
+		if pathLooksLikeSnap(res) {
+			continue
+		}
+		st, err := os.Stat(res)
+		if err != nil || st.IsDir() {
+			continue
+		}
+		return res
+	}
+	return ""
 }
 
 func escapeJS(s string) string {
