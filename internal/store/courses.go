@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 
-	"uts_bot/internal/saia"
+	"uts_bot/internal/coursestatic"
 )
 
 // Course is a Moodle course row returned by the API.
@@ -40,7 +40,7 @@ func ListCourses(ctx context.Context, db *sql.DB) ([]Course, error) {
 
 // SeedCoursesFromStatic upserts the static SAIA course list into courses.
 func SeedCoursesFromStatic(ctx context.Context, tx *sql.Tx) error {
-	for _, c := range saia.UFTMoodleCourses {
+	for _, c := range coursestatic.UFTMoodleCourses {
 		if _, err := tx.ExecContext(ctx, `
 INSERT INTO courses (moodle_course_id, name) VALUES (?, ?)
 ON DUPLICATE KEY UPDATE name = VALUES(name)`,

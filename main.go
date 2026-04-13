@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"log/slog"
 	"os"
@@ -11,10 +12,31 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 )
 
+// denyWarnHandler wraps inner and suppresses slog.LevelWarn (keeps Info and Error).
+type denyWarnHandler struct{ inner slog.Handler }
+
+func (d denyWarnHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	if level == slog.LevelWarn {
+		return false
+	}
+	return d.inner.Enabled(ctx, level)
+}
+
+func (d denyWarnHandler) Handle(ctx context.Context, r slog.Record) error {
+	return d.inner.Handle(ctx, r)
+}
+
+func (d denyWarnHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return denyWarnHandler{inner: d.inner.WithAttrs(attrs)}
+}
+
+func (d denyWarnHandler) WithGroup(name string) slog.Handler {
+	return denyWarnHandler{inner: d.inner.WithGroup(name)}
+}
+
 func main() {
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	})))
+	base := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})
+	slog.SetDefault(slog.New(denyWarnHandler{inner: base}))
 
 	// .env is loaded in internal/config init (before main runs).
 

@@ -1,11 +1,11 @@
 # UTS bot API + MySQL
 #
-# 1. Copy .env and set at least: API_KEY, UTS_USERNAME, UTS_PASSWORD
-# 2. For Compose, point MySQL at the db service (host name "db"), e.g.:
-#    DATABASE_DSN=uts:yourpass@tcp(db:3306)/uft_db?parseTime=true&charset=utf8mb4
-#    (match MYSQL_USER / MYSQL_PASSWORD below)
-# 3. Run migrations once the db is up (see README or mysql client).
-# 4. docker compose up --build
+# 1. cp .env.example .env  → set API_KEY, UTS_USERNAME, UTS_PASSWORD (and DB passwords if you change defaults)
+# 2. DATABASE_DSN must use host "db" and match MYSQL_USER / MYSQL_PASSWORD when running in Compose
+# 3. docker compose up --build
+#    (migrations run automatically before the API starts)
+#
+# See README.md for manual migrate / troubleshooting.
 
 services:
   db:
@@ -30,6 +30,19 @@ services:
       retries: 15
       start_period: 25s
 
+  migrate:
+    image: migrate/migrate:v4.18.3
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./migrations:/migrations:ro
+    command:
+      - "-path=/migrations"
+      - "-database=mysql://root:${MYSQL_ROOT_PASSWORD:-uts_root_change_me}@tcp(db:3306)/uft_db?multiStatements=true&charset=utf8mb4"
+      - "up"
+
   api:
     build: .
     restart: unless-stopped
@@ -43,6 +56,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
 volumes:
   mysql_data:

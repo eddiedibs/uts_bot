@@ -1,4 +1,4 @@
-package saia
+package coursestatic
 
 // UFTMoodleCourses are the SAIA course IDs (view.php?id=…) seeded in
 // migrations/000001_uft_courses.up.sql — keep in sync with the DB migration.

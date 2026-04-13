@@ -15,6 +15,12 @@ import (
 
 const defaultTimeout = 300 * time.Second
 
+// ActivityNameLink is an anchor found inside a div whose class list includes "activityname".
+type ActivityNameLink struct {
+	Href string `json:"href"`
+	Text string `json:"text"`
+}
+
 type Browser struct {
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -211,6 +217,19 @@ func (b *Browser) GetText(sel string) (string, error) {
 	return text, err
 }
 
+// PageDivText returns innerText of div#id "page" (Moodle course layout wrapper), or empty string if absent.
+func (b *Browser) PageDivText() (string, error) {
+	const script = `(function(){
+		var e = document.getElementById('page');
+		return e ? e.innerText : '';
+	})()`
+	var text string
+	if err := b.EvalJS(script, &text); err != nil {
+		return "", err
+	}
+	return text, nil
+}
+
 func (b *Browser) ElementExists(sel string) bool {
 	if err := b.ensureAllocated(); err != nil {
 		return false
@@ -288,6 +307,40 @@ func (b *Browser) EvalJSString(script string) (string, error) {
 	var result string
 	err := b.EvalJS(script, &result)
 	return result, err
+}
+
+// CollectLinksInActivityNameDivs returns every a[href] nested in a div whose class list
+// contains the token activityname (Moodle course module titles).
+func (b *Browser) CollectLinksInActivityNameDivs() ([]ActivityNameLink, error) {
+	const script = `(function(){
+		var out = [];
+		var divs = document.querySelectorAll('div');
+		for (var i = 0; i < divs.length; i++) {
+			var d = divs[i];
+			var cls = d.className;
+			if (!cls || typeof cls !== 'string') continue;
+			var parts = cls.split(/\s+/);
+			var hit = false;
+			for (var j = 0; j < parts.length; j++) {
+				if (parts[j] === 'activityname') { hit = true; break; }
+			}
+			if (!hit) continue;
+			var links = d.querySelectorAll('a[href]');
+			for (var k = 0; k < links.length; k++) {
+				var a = links[k];
+				out.push({ href: a.href, text: (a.innerText || '').trim() });
+			}
+		}
+		return out;
+	})()`
+	var out []ActivityNameLink
+	if err := b.EvalJS(script, &out); err != nil {
+		return nil, err
+	}
+	if out == nil {
+		out = []ActivityNameLink{}
+	}
+	return out, nil
 }
 
 func escapeJS(s string) string {

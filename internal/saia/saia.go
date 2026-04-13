@@ -1,19 +1,27 @@
 package saia
 
 import (
+	"context"
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
 	"uts_bot/internal/browser"
 	"uts_bot/internal/config"
+	"uts_bot/internal/coursestatic"
 	"uts_bot/internal/excel"
+	"uts_bot/internal/store"
 )
 
 type SAIA struct {
 	b *browser.Browser
+	// DB when set, activity links from div.activityname are upserted into activities after each course page load.
+	DB *sql.DB
 }
 
 func New(b *browser.Browser) *SAIA {
@@ -41,7 +49,7 @@ func (s *SAIA) Run(targetPage string) error {
 
 	time.Sleep(2 * time.Second)
 
-	for _, course := range UFTMoodleCourses {
+	for _, course := range coursestatic.UFTMoodleCourses {
 		courseURL, err := courseViewURL(course.MoodleID)
 		if err != nil {
 			return err
@@ -53,11 +61,84 @@ func (s *SAIA) Run(targetPage string) error {
 		}
 		time.Sleep(2 * time.Second)
 
+		if s.DB != nil {
+			if err := s.persistActivityNameLinks(course.Name); err != nil {
+				slog.Error("persist activity name links", "course", course.Name, "err", err)
+			}
+		}
+
 		if err := s.getSAIAActivities(); err != nil {
 			slog.Error("get activities failed", "course", course.Name, "err", err)
 		}
 	}
 	return nil
+}
+
+// RunThenGetSAIAActivities runs the full SAIA crawl (Run), then runs getSAIAActivities
+// again on the browser's current page. Used by the /activities API.
+func (s *SAIA) RunThenGetSAIAActivities(targetPage string) error {
+	if err := s.Run(targetPage); err != nil {
+		return fmt.Errorf("run: %w", err)
+	}
+	if err := s.getSAIAActivities(); err != nil {
+		return fmt.Errorf("get SAIA activities: %w", err)
+	}
+	return nil
+}
+
+func (s *SAIA) persistActivityNameLinks(courseName string) error {
+	links, err := s.b.CollectLinksInActivityNameDivs()
+	if err != nil {
+		return fmt.Errorf("collect activityname links: %w", err)
+	}
+	pageText, err := s.b.PageDivText()
+	if err != nil {
+		return fmt.Errorf("page div text: %w", err)
+	}
+	content, err := json.Marshal(map[string]string{
+		"course_name": courseName,
+		"content":     pageText,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal activity_content: %w", err)
+	}
+
+	var rows []store.ActivityUpsert
+	for _, link := range links {
+		id, ok := moodleActivityModuleID(link.Href)
+		if !ok {
+			continue
+		}
+		name := strings.TrimSpace(link.Text)
+		if name == "" {
+			name = "(no title)"
+		}
+		rows = append(rows, store.ActivityUpsert{
+			MoodleCourseID:  id,
+			Name:            name,
+			Link:            strings.TrimSpace(link.Href),
+			ActivityContent: content,
+		})
+	}
+	ctx := context.Background()
+	return store.UpsertActivities(ctx, s.DB, rows)
+}
+
+// moodleActivityModuleID returns the course-module id from Moodle URLs (?id= on mod pages).
+func moodleActivityModuleID(raw string) (uint32, bool) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return 0, false
+	}
+	idStr := u.Query().Get("id")
+	if idStr == "" {
+		return 0, false
+	}
+	v, err := strconv.ParseUint(idStr, 10, 32)
+	if err != nil || v == 0 {
+		return 0, false
+	}
+	return uint32(v), true
 }
 
 func courseViewURL(moodleCourseID int) (string, error) {
