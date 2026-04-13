@@ -15,7 +15,14 @@ import (
 	"uts_bot/internal/config"
 )
 
-const defaultTimeout = 300 * time.Second
+const (
+	defaultTimeout = 300 * time.Second
+
+	// chromedp defaults to a 10s WebSocket dial; slow hosts/containers often need more.
+	browserDialTimeout = 30 * time.Second
+	// Time to wait for Chrome to print the devtools WebSocket URL on stdout (allocator default is 20s).
+	wsURLReadWait = 60 * time.Second
+)
 
 // ActivityNameLink is an anchor found inside a div whose class list includes "activityname".
 type ActivityNameLink struct {
@@ -43,9 +50,9 @@ func (b *Browser) ensureAllocated() error {
 func New() *Browser {
 	slog.Info("INITIALIZING", "browser_debug", config.BrowserDebug)
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.Flag("remote-debugging-port", "9222"),
-		chromedp.NoFirstRun,
-		chromedp.NoDefaultBrowserCheck,
+		// Let Chrome pick a free port (--remote-debugging-port=0) instead of a fixed port,
+		// which avoids collisions when 9222 is already taken.
+		chromedp.WSURLReadTimeout(wsURLReadWait),
 	)
 	if config.BrowserDebug {
 		// Default options include chromedp.Headless; override for a normal window.
@@ -58,10 +65,14 @@ func New() *Browser {
 	if config.ChromeNoSandbox {
 		// Container / browserless-style Chromium: sandbox off, no zygote, single process,
 		// small /dev/shm friendly flags (see chromedp.NoSandbox, chromedp.DisableGPU).
+		// DefaultExecAllocatorOptions already sets disable-dev-shm-usage; crashpad off avoids
+		// startup hangs in restricted environments.
 		opts = append(opts,
 			chromedp.NoSandbox,
 			chromedp.DisableGPU,
 			chromedp.Flag("disable-dev-shm-usage", true),
+			chromedp.Flag("disable-setuid-sandbox", true),
+			chromedp.Flag("disable-crashpad", true),
 			chromedp.Flag("no-zygote", true),
 			chromedp.Flag("single-process", true),
 		)
@@ -80,8 +91,12 @@ func New() *Browser {
 			slog.Info("no packaged non-snap Chrome/Chromium in standard paths; chromedp uses PATH — set CHROME_BIN if launch fails (avoid snap)")
 		}
 	}
+	// Do not put a short deadline on allocCtx's parent: it would cancel the whole browser
+	// after that duration. Startup slack is handled via WSURLReadTimeout and WithDialTimeout.
 	allocCtx, _ := chromedp.NewExecAllocator(context.Background(), opts...)
-	ctx, cancel := chromedp.NewContext(allocCtx)
+	ctx, cancel := chromedp.NewContext(allocCtx,
+		chromedp.WithBrowserOption(chromedp.WithDialTimeout(browserDialTimeout)),
+	)
 	return &Browser{ctx: ctx, cancel: cancel}
 }
 
