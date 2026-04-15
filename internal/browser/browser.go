@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -62,17 +63,21 @@ func New() *Browser {
 			chromedp.Flag("mute-audio", false),
 		)
 	}
-	if config.ChromeNoSandbox {
-		// Container / browserless-style Chromium: sandbox off, no zygote, single process,
-		// small /dev/shm friendly flags (see chromedp.NoSandbox, chromedp.DisableGPU).
-		// DefaultExecAllocatorOptions already sets disable-dev-shm-usage; crashpad off avoids
-		// startup hangs in restricted environments.
+	headless := !config.BrowserDebug
+	if headless && runtime.GOOS == "linux" || config.ChromeNoSandbox {
 		opts = append(opts,
 			chromedp.NoSandbox,
 			chromedp.DisableGPU,
 			chromedp.Flag("disable-dev-shm-usage", true),
 			chromedp.Flag("disable-setuid-sandbox", true),
 			chromedp.Flag("disable-crashpad", true),
+		)
+	}
+	if config.ChromeNoSandbox {
+		// Extra container / browserless flags: --single-process avoids clone()
+		// failures in Docker; --no-zygote removes the zygote fork. These can
+		// hurt on normal servers, so they're gated behind the explicit env var.
+		opts = append(opts,
 			chromedp.Flag("no-zygote", true),
 			chromedp.Flag("single-process", true),
 		)
@@ -81,14 +86,15 @@ func New() *Browser {
 	case config.ChromeBin != "":
 		logIfSnapChromiumExec("CHROME_BIN", config.ChromeBin)
 		opts = append(opts, chromedp.ExecPath(config.ChromeBin))
-	case config.ChromeNoSandbox:
-		// Snap's "chromium" wrapper fails under restricted users (www-data) or tight
-		// /run permissions; prefer a packaged .deb / Google Chrome binary when unset.
+	default:
+		// Always prefer a non-snap packaged binary when CHROME_BIN is unset.
+		// Snap Chromium fails headless under restricted users, missing
+		// XDG_RUNTIME_DIR, or tight /run permissions — even outside Docker.
 		if p := preferPackagedChromiumExecPath(); p != "" {
-			slog.Info("chromium exec path", "path", p, "note", "non-snap packaged binary (CHROME_NO_SANDBOX, CHROME_BIN unset)")
+			slog.Info("chromium exec path", "path", p, "note", "auto-detected non-snap binary (CHROME_BIN unset)")
 			opts = append(opts, chromedp.ExecPath(p))
 		} else {
-			slog.Info("no packaged non-snap Chrome/Chromium in standard paths; chromedp uses PATH — set CHROME_BIN if launch fails (avoid snap)")
+			slog.Warn("no packaged non-snap Chrome/Chromium found; chromedp will use PATH default — if launch fails, install google-chrome-stable and/or set CHROME_BIN")
 		}
 	}
 	// Do not put a short deadline on allocCtx's parent: it would cancel the whole browser
