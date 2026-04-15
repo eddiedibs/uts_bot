@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -61,19 +62,34 @@ func parseSearchQuery(r *http.Request, emptyDefault string) (string, error) {
 	}
 }
 
+// parseOptionalCourseViewID reads ?course_id= (Moodle course id from course/view.php?id=). Omitted means all courses / no filter.
+func parseOptionalCourseViewID(r *http.Request) (*int, error) {
+	v := strings.TrimSpace(r.URL.Query().Get("course_id"))
+	if v == "" {
+		return nil, nil
+	}
+	n, err := strconv.ParseUint(v, 10, 31)
+	if err != nil || n == 0 {
+		return nil, fmt.Errorf("invalid course_id=%q: must be a positive integer", v)
+	}
+	x := int(n)
+	return &x, nil
+}
+
 // runScraper logs into SAIA and walks courses/activities (Excel export side effects today).
 func (c *Controller) runScraper(ctx context.Context) error {
 	cl := moodlehttp.New()
 	s := saia.New(cl)
-	return s.Run(ctx, config.SAIAPage)
+	return s.Run(ctx, config.SAIAPage, nil)
 }
 
 // runActivitiesScraper runs Run then getSAIAActivities on the same HTTP session.
-func (c *Controller) runActivitiesScraper(ctx context.Context) error {
+// onlyCourseViewID limits the crawl to one course when non-nil (search=page only).
+func (c *Controller) runActivitiesScraper(ctx context.Context, onlyCourseViewID *int) error {
 	cl := moodlehttp.New()
 	s := saia.New(cl)
 	s.DB = c.db
-	return s.RunThenGetSAIAActivities(ctx, config.SAIAPage)
+	return s.RunThenGetSAIAActivities(ctx, config.SAIAPage, onlyCourseViewID)
 }
 
 // Courses returns stored courses. Query: ?search=db (DB only), ?search=page (run scraper, sync static course rows, return list), or omit for legacy auto (fill when empty).
@@ -193,7 +209,7 @@ func (c *Controller) Courses(w http.ResponseWriter, r *http.Request) {
 	writeCoursesJSON(w, courses)
 }
 
-// Activities returns activities from the DB. Query: ?search=db (no scraper), ?search=page (run scraper, upsert activities, then return), or omit for page (backward compatible).
+// Activities returns activities from the DB. Query: ?search=db|page, optional ?course_id= (Moodle course/view id) to filter or limit sync to one course.
 func (c *Controller) Activities(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -208,19 +224,24 @@ func (c *Controller) Activities(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	courseViewID, err := parseOptionalCourseViewID(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	ctx := r.Context()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if mode == "page" {
-		if err := c.runActivitiesScraper(ctx); err != nil {
+		if err := c.runActivitiesScraper(ctx, courseViewID); err != nil {
 			slog.Error("activities scraper failed", "err", err)
 			http.Error(w, "activity sync failed", http.StatusBadGateway)
 			return
 		}
 	}
-	activities, err := store.ListActivities(ctx, c.db)
+	activities, err := store.ListActivities(ctx, c.db, courseViewID)
 	if err != nil {
 		slog.Error("list activities", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)

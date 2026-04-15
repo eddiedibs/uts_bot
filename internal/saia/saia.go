@@ -36,44 +36,64 @@ func New(c *moodlehttp.Client) *SAIA {
 	return &SAIA{c: c}
 }
 
-// Run logs in, walks static courses, persists activity links when DB is set, and syncs Excel deadlines.
-func (s *SAIA) Run(ctx context.Context, targetPage string) error {
+// Run logs in, walks courses (all static courses, or only onlyCourseViewID when set), persists activity links when DB is set, and syncs Excel deadlines.
+func (s *SAIA) Run(ctx context.Context, targetPage string, onlyCourseViewID *int) error {
 	if err := s.c.LoginMoodle(ctx, targetPage, config.Username, config.Password); err != nil {
 		return fmt.Errorf("moodle login: %w", err)
 	}
 
+	if onlyCourseViewID != nil {
+		name := courseLabelForMoodleID(*onlyCourseViewID)
+		s.processCoursePage(ctx, name, *onlyCourseViewID)
+		return nil
+	}
+
 	for _, course := range coursestatic.UFTMoodleCourses {
-		courseURL, err := courseViewURL(course.MoodleID)
-		if err != nil {
-			return err
-		}
-		slog.Info("fetching course", "name", course.Name, "moodle_id", course.MoodleID, "url", courseURL)
-		body, err := s.c.Get(ctx, courseURL)
-		if err != nil {
-			slog.Error("get course page failed", "course", course.Name, "err", err)
-			continue
-		}
-		s.lastCourseURL = courseURL
-		s.lastCourseHTML = body
-		time.Sleep(300 * time.Millisecond)
-
-		if s.DB != nil {
-			if err := s.persistActivityNameLinks(ctx, course.Name, courseURL, body); err != nil {
-				slog.Error("persist activity name links", "course", course.Name, "err", err)
-			}
-		}
-
-		if err := s.getSAIAActivitiesFromCourse(ctx, courseURL, body); err != nil {
-			slog.Error("get activities failed", "course", course.Name, "err", err)
-		}
+		s.processCoursePage(ctx, course.Name, course.MoodleID)
 	}
 	return nil
 }
 
+func courseLabelForMoodleID(moodleCourseID int) string {
+	for _, c := range coursestatic.UFTMoodleCourses {
+		if c.MoodleID == moodleCourseID {
+			return c.Name
+		}
+	}
+	return fmt.Sprintf("course %d", moodleCourseID)
+}
+
+func (s *SAIA) processCoursePage(ctx context.Context, courseName string, moodleCourseID int) {
+	courseURL, err := courseViewURL(moodleCourseID)
+	if err != nil {
+		slog.Error("course view URL", "course", courseName, "err", err)
+		return
+	}
+	slog.Info("fetching course", "name", courseName, "moodle_id", moodleCourseID, "url", courseURL)
+	body, err := s.c.Get(ctx, courseURL)
+	if err != nil {
+		slog.Error("get course page failed", "course", courseName, "err", err)
+		return
+	}
+	s.lastCourseURL = courseURL
+	s.lastCourseHTML = body
+	time.Sleep(300 * time.Millisecond)
+
+	if s.DB != nil {
+		if err := s.persistActivityNameLinks(ctx, courseName, courseURL, body, uint32(moodleCourseID)); err != nil {
+			slog.Error("persist activity name links", "course", courseName, "err", err)
+		}
+	}
+
+	if err := s.getSAIAActivitiesFromCourse(ctx, courseURL, body); err != nil {
+		slog.Error("get activities failed", "course", courseName, "err", err)
+	}
+}
+
 // RunThenGetSAIAActivities runs the full SAIA crawl (Run), then runs getSAIAActivities
 // again on the last fetched course page. Used by the /activities API.
-func (s *SAIA) RunThenGetSAIAActivities(ctx context.Context, targetPage string) error {
-	if err := s.Run(ctx, targetPage); err != nil {
+func (s *SAIA) RunThenGetSAIAActivities(ctx context.Context, targetPage string, onlyCourseViewID *int) error {
+	if err := s.Run(ctx, targetPage, onlyCourseViewID); err != nil {
 		return fmt.Errorf("run: %w", err)
 	}
 	if len(s.lastCourseHTML) == 0 {
@@ -85,7 +105,7 @@ func (s *SAIA) RunThenGetSAIAActivities(ctx context.Context, targetPage string) 
 	return nil
 }
 
-func (s *SAIA) persistActivityNameLinks(ctx context.Context, courseName, coursePageURL string, courseHTML []byte) error {
+func (s *SAIA) persistActivityNameLinks(ctx context.Context, courseName, coursePageURL string, courseHTML []byte, courseViewID uint32) error {
 	base, err := url.Parse(coursePageURL)
 	if err != nil {
 		return fmt.Errorf("parse course page URL: %w", err)
@@ -119,15 +139,18 @@ func (s *SAIA) persistActivityNameLinks(ctx context.Context, courseName, courseP
 			}
 			time.Sleep(200 * time.Millisecond)
 		}
+		cv := courseViewID
 		content, err := json.Marshal(map[string]string{
-			"course_name": courseName,
-			"content":     activityText,
+			"course_name":     courseName,
+			"course_view_id":  strconv.FormatUint(uint64(courseViewID), 10),
+			"content":         activityText,
 		})
 		if err != nil {
 			return fmt.Errorf("marshal activity_content: %w", err)
 		}
 		rows = append(rows, store.ActivityUpsert{
 			MoodleCourseID:  id,
+			CourseViewID:    &cv,
 			Name:            name,
 			Link:            absURL,
 			ActivityContent: content,

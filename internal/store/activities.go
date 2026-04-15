@@ -17,18 +17,22 @@ const (
 
 // Activity is a row from the activities table (API / DB round-trip).
 type Activity struct {
-	MoodleCourseID  int             `json:"moodle_course_id"`
-	CourseName      string          `json:"course_name"`
-	Name            string          `json:"name"`
-	Link            string          `json:"link"`
+	// MoodleCourseID is the activity / course-module id from mod URLs (?id=cmid), not the course page id.
+	MoodleCourseID int `json:"moodle_course_id"`
+	// CourseViewID is the Moodle course id from course/view.php?id= (nil if row predates column).
+	CourseViewID *int `json:"course_view_id,omitempty"`
+	CourseName   string          `json:"course_name"`
+	Name         string          `json:"name"`
+	Link         string          `json:"link"`
 	ActivityContent json.RawMessage `json:"activity_content"`
-	CreatedAt       time.Time       `json:"created_at"`
-	UpdatedAt       time.Time       `json:"updated_at"`
+	CreatedAt    time.Time       `json:"created_at"`
+	UpdatedAt    time.Time       `json:"updated_at"`
 }
 
 // ActivityUpsert is one row for the activities table (moodle_course_id = course module id from ?id=).
 type ActivityUpsert struct {
 	MoodleCourseID  uint32
+	CourseViewID    *uint32 // Moodle course id (course/view.php?id=); nil stores SQL NULL
 	Name            string
 	Link            string
 	ActivityContent json.RawMessage
@@ -46,9 +50,10 @@ func UpsertActivities(ctx context.Context, db *sql.DB, rows []ActivityUpsert) er
 	defer tx.Rollback()
 
 	const q = `
-INSERT INTO activities (moodle_course_id, name, link, activity_content)
-VALUES (?, ?, ?, ?)
+INSERT INTO activities (moodle_course_id, course_view_id, name, link, activity_content)
+VALUES (?, ?, ?, ?, ?)
 ON DUPLICATE KEY UPDATE
+	course_view_id = VALUES(course_view_id),
 	name = VALUES(name),
 	link = VALUES(link),
 	activity_content = VALUES(activity_content)`
@@ -62,7 +67,11 @@ ON DUPLICATE KEY UPDATE
 	for _, row := range rows {
 		name := truncateRunes(row.Name, maxActivityNameLen)
 		link := truncateRunes(row.Link, maxActivityLinkLen)
-		if _, err := stmt.ExecContext(ctx, row.MoodleCourseID, name, link, row.ActivityContent); err != nil {
+		var cv any
+		if row.CourseViewID != nil {
+			cv = *row.CourseViewID
+		}
+		if _, err := stmt.ExecContext(ctx, row.MoodleCourseID, cv, name, link, row.ActivityContent); err != nil {
 			return fmt.Errorf("upsert activity %d: %w", row.MoodleCourseID, err)
 		}
 	}
@@ -72,12 +81,19 @@ ON DUPLICATE KEY UPDATE
 	return nil
 }
 
-// ListActivities returns all activity rows (requires migrations through 000005 for timestamp columns).
-func ListActivities(ctx context.Context, db *sql.DB) ([]Activity, error) {
-	rows, err := db.QueryContext(ctx,
-		`SELECT moodle_course_id, name, link, activity_content, created_at, updated_at
-FROM activities ORDER BY updated_at DESC, moodle_course_id`,
-	)
+// ListActivities returns activity rows. If courseViewID is non-nil, only rows for that Moodle course id
+// (course/view.php?id=) are returned. Requires migration 000006 for course_view_id filtering.
+func ListActivities(ctx context.Context, db *sql.DB, courseViewID *int) ([]Activity, error) {
+	q := `SELECT moodle_course_id, course_view_id, name, link, activity_content, created_at, updated_at
+FROM activities`
+	var args []any
+	if courseViewID != nil {
+		q += ` WHERE course_view_id = ?`
+		args = append(args, *courseViewID)
+	}
+	q += ` ORDER BY updated_at DESC, moodle_course_id`
+
+	rows, err := db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query activities: %w", err)
 	}
@@ -87,11 +103,16 @@ FROM activities ORDER BY updated_at DESC, moodle_course_id`,
 	for rows.Next() {
 		var a Activity
 		var createdAt, updatedAt flexTime
-		if err := rows.Scan(&a.MoodleCourseID, &a.Name, &a.Link, &a.ActivityContent, &createdAt, &updatedAt); err != nil {
+		var courseView sql.NullInt64
+		if err := rows.Scan(&a.MoodleCourseID, &courseView, &a.Name, &a.Link, &a.ActivityContent, &createdAt, &updatedAt); err != nil {
 			return nil, fmt.Errorf("scan activity: %w", err)
 		}
 		a.CreatedAt = createdAt.t
 		a.UpdatedAt = updatedAt.t
+		if courseView.Valid {
+			v := int(courseView.Int64)
+			a.CourseViewID = &v
+		}
 		a.CourseName = courseNameFromActivityContent(a.ActivityContent)
 		out = append(out, a)
 	}
