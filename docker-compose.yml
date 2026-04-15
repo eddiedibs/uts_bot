@@ -50,9 +50,6 @@ services:
       - "${API_PORT:-8080}:8080"
     env_file:
       - .env
-    environment:
-      CHROME_BIN: /usr/bin/chromium
-      CHROME_NO_SANDBOX: "true"
     depends_on:
       db:
         condition: service_healthy

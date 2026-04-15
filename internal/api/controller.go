@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"log/slog"
@@ -8,8 +9,8 @@ import (
 	"sync"
 
 	"uts_bot/internal/apiauth"
-	"uts_bot/internal/browser"
 	"uts_bot/internal/config"
+	"uts_bot/internal/moodlehttp"
 	"uts_bot/internal/saia"
 	"uts_bot/internal/store"
 )
@@ -42,19 +43,18 @@ func (c *Controller) requireAPIKey(w http.ResponseWriter, r *http.Request) bool 
 }
 
 // runScraper logs into SAIA and walks courses/activities (Excel export side effects today).
-func (c *Controller) runScraper() error {
-	b := browser.New()
-	defer b.Close()
-	return saia.New(b).Run(config.SAIAPage)
+func (c *Controller) runScraper(ctx context.Context) error {
+	cl := moodlehttp.New()
+	s := saia.New(cl)
+	return s.Run(ctx, config.SAIAPage)
 }
 
-// runActivitiesScraper runs Run then getSAIAActivities on the same browser session.
-func (c *Controller) runActivitiesScraper() error {
-	b := browser.New()
-	defer b.Close()
-	s := saia.New(b)
+// runActivitiesScraper runs Run then getSAIAActivities on the same HTTP session.
+func (c *Controller) runActivitiesScraper(ctx context.Context) error {
+	cl := moodlehttp.New()
+	s := saia.New(cl)
 	s.DB = c.db
-	return s.RunThenGetSAIAActivities(config.SAIAPage)
+	return s.RunThenGetSAIAActivities(ctx, config.SAIAPage)
 }
 
 // Courses returns stored courses, seeding from SAIA when the table is empty.
@@ -93,7 +93,7 @@ func (c *Controller) Courses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := c.runScraper(); err != nil {
+	if err := c.runScraper(ctx); err != nil {
 		slog.Error("saia sync failed", "err", err)
 		http.Error(w, "course sync failed", http.StatusBadGateway)
 		return
@@ -137,16 +137,15 @@ func (c *Controller) Activities(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ctx := r.Context()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if err := c.runActivitiesScraper(); err != nil {
+	if err := c.runActivitiesScraper(ctx); err != nil {
 		slog.Error("activities scraper failed", "err", err)
 		http.Error(w, "activity sync failed", http.StatusBadGateway)
 		return
 	}
-
-	ctx := r.Context()
 	activities, err := store.ListActivities(ctx, c.db)
 	if err != nil {
 		slog.Error("list activities", "err", err)

@@ -1,6 +1,6 @@
 # uts_bot
 
-HTTP API for UFT SAIA course/activity sync (Go + MySQL + Chromium).
+HTTP API for UFT SAIA course/activity sync (Go + MySQL). The Moodle scraper uses **plain HTTP** with cookie sessions and HTML parsing (no Chrome/Chromium).
 
 ## Run with Docker Compose
 
@@ -64,33 +64,9 @@ docker compose up -d db
 docker compose run --rm migrate
 ```
 
-### Chromium / Snap errors (`cmd_run.go`, `XDG_RUNTIME_DIR`, `mkdir ... snap`)
+### Scraper limitations (HTTP-only)
 
-Those messages come from **Ubuntu’s Snap-packaged Chromium**, not from the `.deb` browser. Snap creates its own home/runtime paths and often **breaks** chromedp under **Docker**, **systemd** services, or **`www-data`**.
-
-**Fix (pick one):**
-
-1. **Use a non-snap browser** and point the app at it:
-
-   ```bash
-   # Debian/Ubuntu package (common paths: /usr/bin/chromium, google-chrome-stable)
-   sudo apt-get update && sudo apt-get install -y chromium || sudo apt-get install -y chromium-browser
-   # Optional: remove snap chromium so PATH does not pick it first
-   sudo snap remove chromium 2>/dev/null || true
-   ```
-
-   In `.env` set an absolute path that **does not** resolve under `/snap/`:
-
-   ```bash
-   CHROME_BIN=/usr/bin/chromium
-   # or: CHROME_BIN=/usr/bin/google-chrome-stable
-   ```
-
-2. **Docker** — the image already sets `CHROME_BIN=/usr/bin/chromium` (Debian package, not Snap). Run the API **inside** that image; do not mount the host’s `/usr/bin/chromium` if it is a Snap shim.
-
-3. **Restricted service user** — ensure `CHROME_BIN` is a packaged binary and the process has a **writable** `HOME` / temp dir (e.g. set `WorkingDirectory` and `HOME` in systemd to something like `/var/lib/uts-bot` with correct ownership).
-
-With **`CHROME_NO_SANDBOX=true`** and **`CHROME_BIN` unset**, the app tries common **non-snap** paths automatically; setting **`CHROME_BIN`** explicitly is still the most reliable.
+Course and activity pages must be **mostly server-rendered HTML** in the response. If Moodle hides collapsed sections until JavaScript runs, some activity links may be missing until the theme is adjusted or the site exposes the same markup without JS.
 
 ### Notes
 
