@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/PuerkitoBio/goquery"
 
@@ -57,7 +58,7 @@ func (s *SAIA) Run(ctx context.Context, targetPage string) error {
 		time.Sleep(300 * time.Millisecond)
 
 		if s.DB != nil {
-			if err := s.persistActivityNameLinks(ctx, course.Name, body); err != nil {
+			if err := s.persistActivityNameLinks(ctx, course.Name, courseURL, body); err != nil {
 				slog.Error("persist activity name links", "course", course.Name, "err", err)
 			}
 		}
@@ -84,21 +85,14 @@ func (s *SAIA) RunThenGetSAIAActivities(ctx context.Context, targetPage string) 
 	return nil
 }
 
-func (s *SAIA) persistActivityNameLinks(ctx context.Context, courseName string, html []byte) error {
-	links, err := collectActivityNameLinks(html)
+func (s *SAIA) persistActivityNameLinks(ctx context.Context, courseName, coursePageURL string, courseHTML []byte) error {
+	base, err := url.Parse(coursePageURL)
+	if err != nil {
+		return fmt.Errorf("parse course page URL: %w", err)
+	}
+	links, err := collectActivityNameLinks(courseHTML)
 	if err != nil {
 		return fmt.Errorf("collect activityname links: %w", err)
-	}
-	pageText, err := pageDivText(html)
-	if err != nil {
-		return fmt.Errorf("page div text: %w", err)
-	}
-	content, err := json.Marshal(map[string]string{
-		"course_name": courseName,
-		"content":     pageText,
-	})
-	if err != nil {
-		return fmt.Errorf("marshal activity_content: %w", err)
 	}
 
 	var rows []store.ActivityUpsert
@@ -111,10 +105,31 @@ func (s *SAIA) persistActivityNameLinks(ctx context.Context, courseName string, 
 		if name == "" {
 			name = "(no title)"
 		}
+		absURL := strings.TrimSpace(resolveHREF(base, link.Href))
+		activityText := ""
+		if absURL != "" {
+			actBody, err := s.c.Get(ctx, absURL)
+			if err != nil {
+				slog.Warn("fetch activity page for activity_content", "url", absURL, "err", err)
+			} else {
+				activityText, err = pageDivText(actBody)
+				if err != nil {
+					slog.Warn("parse activity page #page", "url", absURL, "err", err)
+				}
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+		content, err := json.Marshal(map[string]string{
+			"course_name": courseName,
+			"content":     activityText,
+		})
+		if err != nil {
+			return fmt.Errorf("marshal activity_content: %w", err)
+		}
 		rows = append(rows, store.ActivityUpsert{
 			MoodleCourseID:  id,
 			Name:            name,
-			Link:            strings.TrimSpace(link.Href),
+			Link:            absURL,
 			ActivityContent: content,
 		})
 	}
@@ -287,11 +302,40 @@ func collectActivityNameLinks(html []byte) ([]activityNameLink, error) {
 }
 
 func pageDivText(html []byte) (string, error) {
+	if len(html) == 0 {
+		return "", nil
+	}
 	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(html))
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(doc.Find("#page").First().Text()), nil
+	sel := doc.Find("#page").First()
+	if sel.Length() == 0 {
+		return "", nil
+	}
+	// Remove nodes whose text is not human content (RequireJS/CDATA, styles, etc.).
+	sel.Find("script, style, noscript, template, iframe, object, embed").Remove()
+	raw := strings.TrimSpace(sel.Text())
+	return collapseWhitespace(raw), nil
+}
+
+// collapseWhitespace turns any run of Unicode whitespace into a single ASCII space.
+func collapseWhitespace(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	inSpace := false
+	for _, r := range s {
+		if unicode.IsSpace(r) {
+			inSpace = true
+			continue
+		}
+		if inSpace && b.Len() > 0 {
+			b.WriteByte(' ')
+		}
+		inSpace = false
+		b.WriteRune(r)
+	}
+	return strings.TrimSpace(b.String())
 }
 
 func isUndesired(title string) bool {

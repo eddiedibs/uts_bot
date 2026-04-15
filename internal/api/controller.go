@@ -4,8 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 
 	"uts_bot/internal/apiauth"
@@ -42,6 +44,23 @@ func (c *Controller) requireAPIKey(w http.ResponseWriter, r *http.Request) bool 
 	return true
 }
 
+// searchModeAuto preserves legacy behavior (courses only): fill DB when empty, no-op when already seeded.
+const searchModeAuto = "auto"
+
+// parseSearchQuery reads ?search=db|page. emptyDefault is used when the query param is omitted (e.g. "page" or searchModeAuto).
+func parseSearchQuery(r *http.Request, emptyDefault string) (string, error) {
+	v := strings.TrimSpace(r.URL.Query().Get("search"))
+	if v == "" {
+		return emptyDefault, nil
+	}
+	switch strings.ToLower(v) {
+	case "db", "page":
+		return strings.ToLower(v), nil
+	default:
+		return "", fmt.Errorf("invalid search=%q: use db or page", v)
+	}
+}
+
 // runScraper logs into SAIA and walks courses/activities (Excel export side effects today).
 func (c *Controller) runScraper(ctx context.Context) error {
 	cl := moodlehttp.New()
@@ -57,13 +76,19 @@ func (c *Controller) runActivitiesScraper(ctx context.Context) error {
 	return s.RunThenGetSAIAActivities(ctx, config.SAIAPage)
 }
 
-// Courses returns stored courses, seeding from SAIA when the table is empty.
+// Courses returns stored courses. Query: ?search=db (DB only), ?search=page (run scraper, sync static course rows, return list), or omit for legacy auto (fill when empty).
 func (c *Controller) Courses(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	if !c.requireAPIKey(w, r) {
+		return
+	}
+
+	mode, err := parseSearchQuery(r, searchModeAuto)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -74,6 +99,47 @@ func (c *Controller) Courses(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+
+	switch mode {
+	case "db":
+		writeCoursesJSON(w, courses)
+		return
+	case "page":
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if err := c.runScraper(ctx); err != nil {
+			slog.Error("saia sync failed", "err", err)
+			http.Error(w, "course sync failed", http.StatusBadGateway)
+			return
+		}
+		tx, err := c.db.BeginTx(ctx, nil)
+		if err != nil {
+			slog.Error("begin tx", "err", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		defer tx.Rollback()
+		if err := store.SeedCoursesFromStatic(ctx, tx); err != nil {
+			slog.Error("seed courses", "err", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			slog.Error("commit", "err", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		courses, err = store.ListCourses(ctx, c.db)
+		if err != nil {
+			slog.Error("list courses after page sync", "err", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		writeCoursesJSON(w, courses)
+		return
+	}
+
+	// searchModeAuto — same as before: fast path when rows exist; otherwise scrape + seed once.
 	if len(courses) > 0 {
 		writeCoursesJSON(w, courses)
 		return
@@ -127,7 +193,7 @@ func (c *Controller) Courses(w http.ResponseWriter, r *http.Request) {
 	writeCoursesJSON(w, courses)
 }
 
-// Activities runs the SAIA scraper, upserts activity rows, then returns all activities from the DB as JSON.
+// Activities returns activities from the DB. Query: ?search=db (no scraper), ?search=page (run scraper, upsert activities, then return), or omit for page (backward compatible).
 func (c *Controller) Activities(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -137,14 +203,22 @@ func (c *Controller) Activities(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	mode, err := parseSearchQuery(r, "page")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	ctx := r.Context()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if err := c.runActivitiesScraper(ctx); err != nil {
-		slog.Error("activities scraper failed", "err", err)
-		http.Error(w, "activity sync failed", http.StatusBadGateway)
-		return
+	if mode == "page" {
+		if err := c.runActivitiesScraper(ctx); err != nil {
+			slog.Error("activities scraper failed", "err", err)
+			http.Error(w, "activity sync failed", http.StatusBadGateway)
+			return
+		}
 	}
 	activities, err := store.ListActivities(ctx, c.db)
 	if err != nil {

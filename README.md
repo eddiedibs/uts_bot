@@ -49,6 +49,14 @@ HTTP API for UFT SAIA course/activity sync (Go + MySQL). The Moodle scraper uses
    curl -sS -H "X-API-Key: YOUR_API_KEY" "http://localhost:8080/api/v1/activities"
    ```
 
+   Optional query **`search`** (both endpoints accept **`db`** | **`page`**; invalid values return **400**):
+
+   - **`/api/v1/activities?search=db`** — return stored activities only (no Moodle crawl).
+   - **`/api/v1/activities?search=page`** — run the scraper, upsert the DB, then return activities (same as omitting `search`, the default for this route).
+   - **`/api/v1/courses?search=db`** — return courses from the DB only (empty list if never seeded).
+   - **`/api/v1/courses?search=page`** — run the scraper, re-seed course names from the static list, then return courses.
+   - **`/api/v1/courses`** with no `search` — legacy behavior: return DB rows if any exist; otherwise scrape once, seed, then return.
+
 4. **Stop**
 
    ```bash
