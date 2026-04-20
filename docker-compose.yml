@@ -1,0 +1,60 @@
+# UTS bot API + MySQL
+#
+# 1. cp .env.example .env  → set API_KEY, UTS_USERNAME, UTS_PASSWORD (and DB passwords if you change defaults)
+# 2. DATABASE_DSN must use host "db" and match MYSQL_USER / MYSQL_PASSWORD when running in Compose
+# 3. docker compose up --build -d   (note: "docker compose", not "docker-compose" unless you use the legacy binary)
+#    (migrations run automatically before the API starts)
+#
+# See README.md for manual migrate / troubleshooting.
+
+services:
+  db:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-uts_root_change_me}
+      MYSQL_DATABASE: uft_db
+      MYSQL_USER: ${MYSQL_USER:-uts}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-uts_pass_change_me}
+    command: >
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - mysql_data:/var/lib/mysql
+    ports:
+      - "${MYSQL_PUBLISH_PORT:-3306}:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+      start_period: 25s
+
+  migrate:
+    image: migrate/migrate:v4.18.3
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./migrations:/migrations:ro
+    command:
+      - "-path=/migrations"
+      - "-database=mysql://root:${MYSQL_ROOT_PASSWORD:-uts_root_change_me}@tcp(db:3306)/uft_db?multiStatements=true&charset=utf8mb4"
+      - "up"
+
+  api:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-8080}:8080"
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  mysql_data:
