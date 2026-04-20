@@ -1,0 +1,12 @@
+.git
+.cursor
+venv
+__pycache__
+*.md
+.env
+.env.*
+*.xlsx
+*xlsx#
+test.py
+.vscode
+uts_bot
