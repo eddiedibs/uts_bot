@@ -102,6 +102,7 @@ func (c *Controller) Courses(w http.ResponseWriter, r *http.Request) {
 	if !c.requireAPIKey(w, r) {
 		return
 	}
+	slog.Info("endpoint consulted", "endpoint", "/api/v1/courses", "remote_addr", r.RemoteAddr, "search", r.URL.Query().Get("search"))
 
 	mode, err := parseSearchQuery(r, searchModeAuto)
 	if err != nil {
@@ -219,6 +220,7 @@ func (c *Controller) Activities(w http.ResponseWriter, r *http.Request) {
 	if !c.requireAPIKey(w, r) {
 		return
 	}
+	slog.Info("endpoint consulted", "endpoint", "/api/v1/activities", "remote_addr", r.RemoteAddr, "search", r.URL.Query().Get("search"), "course_id", r.URL.Query().Get("course_id"))
 
 	mode, err := parseSearchQuery(r, "page")
 	if err != nil {
