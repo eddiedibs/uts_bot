@@ -49,6 +49,17 @@ func (c *Controller) requireAPIKey(w http.ResponseWriter, r *http.Request) bool 
 // searchModeAuto preserves legacy behavior (courses only): fill DB when empty, no-op when already seeded.
 const searchModeAuto = "auto"
 
+// scraperSyncMaxWall caps one Moodle sync. Keep below http.Server WriteTimeout (see internal/api/server.go).
+const scraperSyncMaxWall = 14 * time.Minute
+
+// detachedScrapeContext returns a context that is not cancelled when the HTTP client disconnects,
+// so long syncs are not interrupted by proxy/client idle timeouts. It still respects a max wall
+// clock and carries request values from parent (for any future tracing).
+func detachedScrapeContext(parent context.Context) (context.Context, context.CancelFunc) {
+	base := context.WithoutCancel(parent)
+	return context.WithTimeout(base, scraperSyncMaxWall)
+}
+
 // parseSearchQuery reads ?search=db|page. emptyDefault is used when the query param is omitted (e.g. "page" or searchModeAuto).
 func parseSearchQuery(r *http.Request, emptyDefault string) (string, error) {
 	v := strings.TrimSpace(r.URL.Query().Get("search"))
@@ -125,19 +136,21 @@ func (c *Controller) Courses(w http.ResponseWriter, r *http.Request) {
 	case "page":
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		if err := c.runScraper(ctx); err != nil {
+		scrapeCtx, cancel := detachedScrapeContext(ctx)
+		defer cancel()
+		if err := c.runScraper(scrapeCtx); err != nil {
 			slog.Error("saia sync failed", "err", err)
 			http.Error(w, "course sync failed", http.StatusBadGateway)
 			return
 		}
-		tx, err := c.db.BeginTx(ctx, nil)
+		tx, err := c.db.BeginTx(scrapeCtx, nil)
 		if err != nil {
 			slog.Error("begin tx", "err", err)
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
 		defer tx.Rollback()
-		if err := store.SeedCoursesFromStatic(ctx, tx); err != nil {
+		if err := store.SeedCoursesFromStatic(scrapeCtx, tx); err != nil {
 			slog.Error("seed courses", "err", err)
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
@@ -147,7 +160,7 @@ func (c *Controller) Courses(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
-		courses, err = store.ListCourses(ctx, c.db)
+		courses, err = store.ListCourses(scrapeCtx, c.db)
 		if err != nil {
 			slog.Error("list courses after page sync", "err", err)
 			http.Error(w, "internal error", http.StatusInternalServerError)
@@ -177,13 +190,15 @@ func (c *Controller) Courses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := c.runScraper(ctx); err != nil {
+	scrapeCtx, cancel := detachedScrapeContext(ctx)
+	defer cancel()
+	if err := c.runScraper(scrapeCtx); err != nil {
 		slog.Error("saia sync failed", "err", err)
 		http.Error(w, "course sync failed", http.StatusBadGateway)
 		return
 	}
 
-	tx, err := c.db.BeginTx(ctx, nil)
+	tx, err := c.db.BeginTx(scrapeCtx, nil)
 	if err != nil {
 		slog.Error("begin tx", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -191,7 +206,7 @@ func (c *Controller) Courses(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 
-	if err := store.SeedCoursesFromStatic(ctx, tx); err != nil {
+	if err := store.SeedCoursesFromStatic(scrapeCtx, tx); err != nil {
 		slog.Error("seed courses", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -202,7 +217,7 @@ func (c *Controller) Courses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	courses, err = store.ListCourses(ctx, c.db)
+	courses, err = store.ListCourses(scrapeCtx, c.db)
 	if err != nil {
 		slog.Error("list courses after seed", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -234,17 +249,21 @@ func (c *Controller) Activities(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
+	listCtx := ctx
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if mode == "page" {
-		if err := c.runActivitiesScraper(ctx, courseViewID); err != nil {
+		scrapeCtx, cancel := detachedScrapeContext(ctx)
+		defer cancel()
+		listCtx = scrapeCtx
+		if err := c.runActivitiesScraper(scrapeCtx, courseViewID); err != nil {
 			slog.Error("activities scraper failed", "err", err)
 			http.Error(w, "activity sync failed", http.StatusBadGateway)
 			return
 		}
 	}
-	activities, err := store.ListActivities(ctx, c.db, courseViewID)
+	activities, err := store.ListActivities(listCtx, c.db, courseViewID)
 	if err != nil {
 		slog.Error("list activities", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -254,7 +273,7 @@ func (c *Controller) Activities(w http.ResponseWriter, r *http.Request) {
 	for i, a := range activities {
 		ids[i] = a.MoodleCourseID
 	}
-	attachments, err := store.ListAttachmentsByActivityIDs(ctx, c.db, ids)
+	attachments, err := store.ListAttachmentsByActivityIDs(listCtx, c.db, ids)
 	if err != nil {
 		slog.Error("list attachments", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
