@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -35,6 +36,8 @@ func NewController(db *sql.DB, apiKey string) *Controller {
 func (c *Controller) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/courses", c.Courses)
 	mux.HandleFunc("/api/v1/activities", c.Activities)
+	mux.HandleFunc("GET /api/v1/courses/{courseViewID}/attachments", c.CourseAttachmentList)
+	mux.HandleFunc("GET /api/v1/attachments/content", c.AttachmentContent)
 }
 
 func (c *Controller) requireAPIKey(w http.ResponseWriter, r *http.Request) bool {
@@ -280,6 +283,103 @@ func (c *Controller) Activities(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeActivitiesJSON(w, activities, attachments)
+}
+
+// CourseAttachmentList returns attachment file names and timestamps for a Moodle course (course/view.php?id=).
+func (c *Controller) CourseAttachmentList(w http.ResponseWriter, r *http.Request) {
+	if !c.requireAPIKey(w, r) {
+		return
+	}
+	idStr := r.PathValue("courseViewID")
+	courseViewID, err := strconv.Atoi(idStr)
+	if err != nil || courseViewID <= 0 {
+		http.Error(w, "invalid course id in path", http.StatusBadRequest)
+		return
+	}
+	ctx := r.Context()
+	list, err := store.ListAttachmentSummariesByCourseViewID(ctx, c.db, courseViewID)
+	if err != nil {
+		slog.Error("list attachment summaries", "course_view_id", courseViewID, "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(true)
+	_ = enc.Encode(map[string]any{
+		"course_view_id": courseViewID,
+		"attachments":    list,
+	})
+}
+
+// AttachmentContent returns one attachment body. Query: file_name (required) and either activity_id
+// (activity cmid, same as activities.moodle_course_id) or course_id (Moodle course/view id). If only
+// course_id is given, file_name must be unique within that course or 409 is returned.
+func (c *Controller) AttachmentContent(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !c.requireAPIKey(w, r) {
+		return
+	}
+	fileName := strings.TrimSpace(r.URL.Query().Get("file_name"))
+	if fileName == "" {
+		http.Error(w, "missing file_name query parameter", http.StatusBadRequest)
+		return
+	}
+	activityID, activityErr := parseOptionalPositiveIntQuery(r, "activity_id")
+	courseID, courseErr := parseOptionalPositiveIntQuery(r, "course_id")
+	if activityErr != nil || courseErr != nil {
+		http.Error(w, "invalid activity_id or course_id", http.StatusBadRequest)
+		return
+	}
+	if activityID == nil && courseID == nil {
+		http.Error(w, "pass activity_id or course_id together with file_name", http.StatusBadRequest)
+		return
+	}
+	if activityID != nil && courseID != nil {
+		http.Error(w, "pass only one of activity_id or course_id", http.StatusBadRequest)
+		return
+	}
+
+	ctx := r.Context()
+	var row store.AttachmentContentRow
+	var getErr error
+	if activityID != nil {
+		row, getErr = store.GetAttachmentByActivityAndFileName(ctx, c.db, *activityID, fileName)
+	} else {
+		row, getErr = store.GetAttachmentByCourseViewIDAndFileName(ctx, c.db, *courseID, fileName)
+	}
+	if errors.Is(getErr, store.ErrAttachmentNotFound) {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if errors.Is(getErr, store.ErrAttachmentAmbiguous) {
+		http.Error(w, getErr.Error(), http.StatusConflict)
+		return
+	}
+	if getErr != nil {
+		slog.Error("get attachment content", "err", getErr)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(true)
+	_ = enc.Encode(row)
+}
+
+func parseOptionalPositiveIntQuery(r *http.Request, name string) (*int, error) {
+	v := strings.TrimSpace(r.URL.Query().Get(name))
+	if v == "" {
+		return nil, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return nil, fmt.Errorf("bad %s", name)
+	}
+	return &n, nil
 }
 
 func writeCoursesJSON(w http.ResponseWriter, courses []store.Course) {

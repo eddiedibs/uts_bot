@@ -58,6 +58,12 @@ HTTP API for UFT SAIA course/activity sync (Go + MySQL). The Moodle scraper uses
    - **`/api/v1/courses?search=page`** — run the scraper, re-seed course names from the static list, then return courses.
    - **`/api/v1/courses`** with no `search` — legacy behavior: return DB rows if any exist; otherwise scrape once, seed, then return.
 
+   **Attachments** (same `X-API-Key` / Bearer auth):
+
+   - **`GET /api/v1/courses/{courseViewID}/attachments`** — JSON list of `file_name`, `created_at`, `updated_at` for that Moodle course (`course/view.php?id=`). Example: `curl -sS -H "X-API-Key: KEY" "http://localhost:8080/api/v1/courses/23347/attachments"`.
+   - **`GET /api/v1/attachments/content?file_name=...&activity_id=...`** — full attachment JSON including `file_content` (activity `activity_id` = activity cmid / `activities.moodle_course_id`).
+   - **`GET /api/v1/attachments/content?file_name=...&course_id=...`** — same when `file_name` is unique within that course; **409** if more than one match (then use `activity_id`).
+
 4. **Stop**
 
    ```bash
