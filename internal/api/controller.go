@@ -272,17 +272,7 @@ func (c *Controller) Activities(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	ids := make([]int, len(activities))
-	for i, a := range activities {
-		ids[i] = a.MoodleCourseID
-	}
-	attachments, err := store.ListAttachmentsByActivityIDs(listCtx, c.db, ids)
-	if err != nil {
-		slog.Error("list attachments", "err", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	writeActivitiesJSON(w, activities, attachments)
+	writeActivitiesJSON(w, activities)
 }
 
 // CourseAttachmentList returns attachment file names and timestamps for a Moodle course (course/view.php?id=).
@@ -389,11 +379,6 @@ func writeCoursesJSON(w http.ResponseWriter, courses []store.Course) {
 	_ = enc.Encode(map[string]any{"courses": courses})
 }
 
-type attachmentItem struct {
-	FileName    string `json:"file_name"`
-	FileContent string `json:"file_content"`
-}
-
 type activityResponse struct {
 	MoodleCourseID  int             `json:"moodle_course_id"`
 	CourseViewID    *int            `json:"course_view_id,omitempty"`
@@ -403,20 +388,11 @@ type activityResponse struct {
 	ActivityContent json.RawMessage `json:"activity_content"`
 	CreatedAt       time.Time       `json:"created_at"`
 	UpdatedAt       time.Time       `json:"updated_at"`
-	Attachments     []attachmentItem `json:"attachments"`
 }
 
-func writeActivitiesJSON(w http.ResponseWriter, activities []store.Activity, attachments map[int][]store.ActivityAttachment) {
+func writeActivitiesJSON(w http.ResponseWriter, activities []store.Activity) {
 	responses := make([]activityResponse, len(activities))
 	for i, a := range activities {
-		atts := attachments[a.MoodleCourseID]
-		items := make([]attachmentItem, 0, len(atts))
-		for _, att := range atts {
-			items = append(items, attachmentItem{
-				FileName:    att.FileName,
-				FileContent: att.FileContent,
-			})
-		}
 		responses[i] = activityResponse{
 			MoodleCourseID:  a.MoodleCourseID,
 			CourseViewID:    a.CourseViewID,
@@ -426,7 +402,6 @@ func writeActivitiesJSON(w http.ResponseWriter, activities []store.Activity, att
 			ActivityContent: a.ActivityContent,
 			CreatedAt:       a.CreatedAt,
 			UpdatedAt:       a.UpdatedAt,
-			Attachments:     items,
 		}
 	}
 	w.Header().Set("Content-Type", "application/json")
