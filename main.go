@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"log/slog"
 	"os"
+	"time"
 
 	"uts_bot/internal/api"
 	"uts_bot/internal/config"
@@ -105,6 +106,14 @@ func main() {
 		slog.Error("database ping", "err", err)
 		os.Exit(1)
 	}
+	// Long Moodle crawls can go minutes without touching the DB while connections sit idle in the
+	// pool. MySQL (or proxies) then close those sessions (wait_timeout / EOF); the next query can get
+	// "invalid connection". Evict idle conns from the pool before the server does.
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxIdleTime(90 * time.Second)
+	db.SetConnMaxLifetime(30 * time.Minute)
+
 	if err := api.Run(db, config.APIKey); err != nil {
 		slog.Error("api server", "err", err)
 		os.Exit(1)
