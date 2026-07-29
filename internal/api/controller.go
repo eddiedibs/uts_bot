@@ -36,6 +36,7 @@ func NewController(db *sql.DB, apiKey string) *Controller {
 func (c *Controller) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/courses", c.Courses)
 	mux.HandleFunc("/api/v1/activities", c.Activities)
+	mux.HandleFunc("/api/v1/califications", c.Califications)
 	mux.HandleFunc("GET /api/v1/courses/{courseViewID}/attachments", c.CourseAttachmentList)
 	mux.HandleFunc("GET /api/v1/attachments/content", c.AttachmentContent)
 }
@@ -273,6 +274,48 @@ func (c *Controller) Activities(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeActivitiesJSON(w, activities)
+}
+
+// Califications returns Moodle grade report rows for one course (?course_id= required, Moodle course/view id).
+func (c *Controller) Califications(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !c.requireAPIKey(w, r) {
+		return
+	}
+	courseViewID, err := parseOptionalCourseViewID(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if courseViewID == nil {
+		http.Error(w, "missing course_id query parameter", http.StatusBadRequest)
+		return
+	}
+	slog.Info("endpoint consulted", "endpoint", "/api/v1/califications", "remote_addr", r.RemoteAddr, "course_id", *courseViewID)
+
+	ctx := r.Context()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	scrapeCtx, cancel := detachedScrapeContext(ctx)
+	defer cancel()
+
+	cl := moodlehttp.New()
+	s := saia.New(cl)
+	report, err := s.GetCourseCalifications(scrapeCtx, config.SAIAPage, *courseViewID)
+	if err != nil {
+		slog.Error("fetch califications failed", "course_id", *courseViewID, "err", err)
+		http.Error(w, "califications fetch failed", http.StatusBadGateway)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(true)
+	_ = enc.Encode(report)
 }
 
 // CourseAttachmentList returns attachment file names and timestamps for a Moodle course (course/view.php?id=).

@@ -64,6 +64,10 @@ HTTP API for UFT SAIA course/activity sync (Go + MySQL). The Moodle scraper uses
    - **`GET /api/v1/attachments/content?file_name=...&activity_id=...`** — full attachment JSON including `file_content` (activity `activity_id` = activity cmid / `activities.moodle_course_id`).
    - **`GET /api/v1/attachments/content?file_name=...&course_id=...`** — same when `file_name` is unique within that course; **409** if more than one match (then use `activity_id`).
 
+   **Calificaciones** (live Moodle grade report; requires `course_id`):
+
+   - **`GET /api/v1/califications?course_id=23265`** — logs into SAIA, opens the course page, follows the **Calificaciones** link (`grade/report/index.php?id=`), parses `table.user-grade`, and returns JSON with `rows` (categories, assignments/forums/quizzes, subtotals, course total). Example: `curl -sS -H "X-API-Key: KEY" "http://localhost:8080/api/v1/califications?course_id=23265"`.
+
 4. **Stop**
 
    ```bash
