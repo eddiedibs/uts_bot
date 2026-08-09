@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -29,16 +30,30 @@ type ActivityAttachmentUpsert struct {
 	FileContent    string
 }
 
-// UpsertActivityAttachments inserts or updates attachment rows by primary key (moodle_course_id, file_name).
-func UpsertActivityAttachments(ctx context.Context, db *sql.DB, rows []ActivityAttachmentUpsert) error {
+// UpsertActivityAttachments inserts or updates attachment rows by primary key
+// (moodle_course_id, file_name) and returns one OutboxEvent per newly seen attachment.
+//
+// Only existence is compared, never file_content: the parsed text of a PDF can shift between
+// scrapes for reasons the student does not care about, and "this file now says something
+// slightly different" is not a useful notification.
+func UpsertActivityAttachments(ctx context.Context, db *sql.DB, rows []ActivityAttachmentUpsert, courseViewID *uint32, courseName string) ([]OutboxEvent, error) {
 	if len(rows) == 0 {
-		return nil
+		return nil, nil
 	}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
+		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	ids := make([]uint32, 0, len(rows))
+	for _, row := range rows {
+		ids = append(ids, row.MoodleCourseID)
+	}
+	existing, err := selectAttachmentKeys(ctx, tx, ids)
+	if err != nil {
+		return nil, err
+	}
 
 	const q = `
 INSERT INTO activities_attachments (moodle_course_id, file_name, file_content)
@@ -48,19 +63,71 @@ ON DUPLICATE KEY UPDATE
 
 	stmt, err := tx.PrepareContext(ctx, q)
 	if err != nil {
-		return fmt.Errorf("prepare upsert: %w", err)
+		return nil, fmt.Errorf("prepare upsert: %w", err)
 	}
 	defer stmt.Close()
 
+	var events []OutboxEvent
 	for _, row := range rows {
 		if _, err := stmt.ExecContext(ctx, row.MoodleCourseID, row.FileName, row.FileContent); err != nil {
-			return fmt.Errorf("upsert attachment %d/%s: %w", row.MoodleCourseID, row.FileName, err)
+			return nil, fmt.Errorf("upsert attachment %d/%s: %w", row.MoodleCourseID, row.FileName, err)
 		}
+		key := attachmentKey(row.MoodleCourseID, row.FileName)
+		if existing[key] {
+			continue
+		}
+		// Guard against the same file being linked twice on one activity page.
+		existing[key] = true
+		events = append(events, OutboxEvent{
+			EventType:    EventTypeAttachment,
+			ChangeType:   ChangeTypeNew,
+			CourseViewID: courseViewID,
+			CourseName:   courseName,
+			EntityKey:    key,
+			Title:        row.FileName,
+			Detail:       row.FileName,
+		})
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit: %w", err)
+		return nil, fmt.Errorf("commit: %w", err)
 	}
-	return nil
+	return events, nil
+}
+
+func attachmentKey(moodleCourseID uint32, fileName string) string {
+	return strconv.FormatUint(uint64(moodleCourseID), 10) + "/" + fileName
+}
+
+func selectAttachmentKeys(ctx context.Context, tx *sql.Tx, ids []uint32) (map[string]bool, error) {
+	out := make(map[string]bool)
+	if len(ids) == 0 {
+		return out, nil
+	}
+	placeholders := make([]string, len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	q := fmt.Sprintf(
+		`SELECT moodle_course_id, file_name FROM activities_attachments WHERE moodle_course_id IN (%s)`,
+		strings.Join(placeholders, ","),
+	)
+	rows, err := tx.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("select existing attachments: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id uint32
+		var fileName string
+		if err := rows.Scan(&id, &fileName); err != nil {
+			return nil, fmt.Errorf("scan existing attachment: %w", err)
+		}
+		out[attachmentKey(id, fileName)] = true
+	}
+	return out, rows.Err()
 }
 
 // ListAttachmentsByActivityIDs returns all attachments for the given moodle_course_ids,

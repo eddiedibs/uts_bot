@@ -8,15 +8,20 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
 	"uts_bot/internal/config"
+	"uts_bot/internal/scheduler"
 )
 
-// Run starts the HTTP server until SIGINT/SIGTERM.
+// Run starts the HTTP server until SIGINT/SIGTERM, along with the background scrape scheduler.
 func Run(db *sql.DB, apiKey string) error {
-	ctr := NewController(db, apiKey)
+	// One lock shared by the API handlers and the scheduler: only one Moodle session at a time.
+	scrapeMu := &sync.Mutex{}
+
+	ctr := NewController(db, apiKey, scrapeMu)
 	mux := http.NewServeMux()
 	ctr.RegisterRoutes(mux)
 
@@ -30,6 +35,9 @@ func Run(db *sql.DB, apiKey string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	sched := scheduler.Start(ctx, db, scrapeMu)
+	defer sched.Stop()
 
 	errCh := make(chan error, 1)
 	go func() {

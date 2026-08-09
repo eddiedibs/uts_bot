@@ -29,6 +29,10 @@ type SAIA struct {
 	c *moodlehttp.Client
 	// DB when set, activity links from div.activityname are upserted into activities after each course page load.
 	DB *sql.DB
+	// Events accumulates the notification-worthy changes detected during this crawl. Callers own
+	// flushing them (see TakeEvents), so a whole cycle lands in the outbox atomically and the
+	// notifier never sees a half-finished scrape.
+	Events []store.OutboxEvent
 
 	lastCourseURL  string
 	lastCourseHTML []byte
@@ -38,6 +42,14 @@ func New(c *moodlehttp.Client) *SAIA {
 	return &SAIA{c: c}
 }
 
+// TakeEvents returns the events collected so far and clears the buffer, so a long-lived SAIA
+// cannot replay the same change on a later cycle.
+func (s *SAIA) TakeEvents() []store.OutboxEvent {
+	events := s.Events
+	s.Events = nil
+	return events
+}
+
 // Run logs in, walks courses (all static courses, or only onlyCourseViewID when set), persists activity links when DB is set, and syncs Excel deadlines.
 func (s *SAIA) Run(ctx context.Context, targetPage string, onlyCourseViewID *int) error {
 	if err := s.c.LoginMoodle(ctx, targetPage, config.Username, config.Password); err != nil {
@@ -45,7 +57,7 @@ func (s *SAIA) Run(ctx context.Context, targetPage string, onlyCourseViewID *int
 	}
 
 	if onlyCourseViewID != nil {
-		name := courseLabelForMoodleID(*onlyCourseViewID)
+		name := CourseLabelForMoodleID(*onlyCourseViewID)
 		s.processCoursePage(ctx, name, *onlyCourseViewID)
 		return nil
 	}
@@ -56,7 +68,9 @@ func (s *SAIA) Run(ctx context.Context, targetPage string, onlyCourseViewID *int
 	return nil
 }
 
-func courseLabelForMoodleID(moodleCourseID int) string {
+// CourseLabelForMoodleID resolves a human course name from the static course list, falling back
+// to a generic label so notifications never show a bare id.
+func CourseLabelForMoodleID(moodleCourseID int) string {
 	for _, c := range coursestatic.UFTMoodleCourses {
 		if c.MoodleID == moodleCourseID {
 			return c.Name
@@ -186,10 +200,64 @@ func (s *SAIA) persistActivityNameLinks(ctx context.Context, courseName, courseP
 			ActivityContent: content,
 		})
 	}
-	if err := store.UpsertActivities(ctx, s.DB, rows); err != nil {
+	cv := courseViewID
+	activityEvents, err := store.UpsertActivities(ctx, s.DB, rows, courseName)
+	if err != nil {
 		return err
 	}
-	return store.UpsertActivityAttachments(ctx, s.DB, attachmentRows)
+	s.Events = append(s.Events, activityEvents...)
+
+	attachmentEvents, err := store.UpsertActivityAttachments(ctx, s.DB, attachmentRows, &cv, courseName)
+	if err != nil {
+		return err
+	}
+	s.Events = append(s.Events, attachmentEvents...)
+	return nil
+}
+
+// PersistCourseGrades scrapes the grade report for one course, stores it, and collects an event
+// for every item whose mark appeared or changed.
+func (s *SAIA) PersistCourseGrades(ctx context.Context, courseName string, moodleCourseID int) error {
+	if s.DB == nil {
+		return nil
+	}
+	report, err := s.GetCourseCalifications(ctx, config.SAIAPage, moodleCourseID)
+	if err != nil {
+		return fmt.Errorf("get califications: %w", err)
+	}
+	events, err := PersistCourseGradeReport(ctx, s.DB, courseName, report)
+	if err != nil {
+		return err
+	}
+	s.Events = append(s.Events, events...)
+	return nil
+}
+
+// PersistCourseGradeReport stores an already-fetched grade report. It is split out from
+// PersistCourseGrades so the /califications handler can persist the same report it is about to
+// return without scraping Moodle twice.
+func PersistCourseGradeReport(ctx context.Context, db *sql.DB, courseName string, report *CourseGrades) ([]store.OutboxEvent, error) {
+	if db == nil || report == nil || len(report.Rows) == 0 {
+		return nil, nil
+	}
+	rows := make([]store.GradeUpsert, 0, len(report.Rows))
+	for _, r := range report.Rows {
+		rows = append(rows, store.GradeUpsert{
+			RowType:      r.RowType,
+			CategoryPath: r.CategoryPath,
+			ActivityType: r.ActivityType,
+			ItemName:     r.Name,
+			Grade:        r.Grade,
+			Percentage:   r.Percentage,
+			Weight:       r.Weight,
+			Link:         r.Link,
+		})
+	}
+	events, err := store.UpsertGrades(ctx, db, uint32(report.CourseViewID), courseName, rows)
+	if err != nil {
+		return nil, fmt.Errorf("upsert grades for course %d: %w", report.CourseViewID, err)
+	}
+	return events, nil
 }
 
 // moodleActivityModuleID returns the course-module id from Moodle URLs (?id= on mod pages).

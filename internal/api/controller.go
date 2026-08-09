@@ -25,12 +25,19 @@ import (
 type Controller struct {
 	db     *sql.DB
 	apiKey string
-	mu     sync.Mutex
+	// mu serializes everything that opens a Moodle session. It is a pointer because the
+	// background scheduler holds the same lock: two concurrent logins invalidate each other's
+	// session cookie.
+	mu *sync.Mutex
 }
 
-// NewController builds the API controller used to mount every route.
-func NewController(db *sql.DB, apiKey string) *Controller {
-	return &Controller{db: db, apiKey: apiKey}
+// NewController builds the API controller used to mount every route. scrapeMu must be the same
+// mutex handed to the scheduler.
+func NewController(db *sql.DB, apiKey string, scrapeMu *sync.Mutex) *Controller {
+	if scrapeMu == nil {
+		scrapeMu = &sync.Mutex{}
+	}
+	return &Controller{db: db, apiKey: apiKey, mu: scrapeMu}
 }
 
 // RegisterRoutes attaches all API handlers to mux.
@@ -107,7 +114,30 @@ func (c *Controller) runActivitiesScraper(ctx context.Context, onlyCourseViewID 
 	cl := moodlehttp.New()
 	s := saia.New(cl)
 	s.DB = c.db
-	return s.RunThenGetSAIAActivities(ctx, config.SAIAPage, onlyCourseViewID)
+	err := s.RunThenGetSAIAActivities(ctx, config.SAIAPage, onlyCourseViewID)
+	// Publish whatever was detected even on a partial failure: the rows are already committed,
+	// so dropping the events would lose those notifications permanently.
+	publishOutboxEvents(ctx, c.db, s.TakeEvents())
+	return err
+}
+
+// publishOutboxEvents commits a scrape cycle's events in one transaction. Failing to publish is
+// logged rather than propagated: the scrape itself succeeded, and the caller's response should
+// not turn into a 502 because a notification could not be queued.
+func publishOutboxEvents(ctx context.Context, db *sql.DB, events []store.OutboxEvent) {
+	if len(events) == 0 {
+		return
+	}
+	// Detach from ctx: the rows these events describe are already committed, so a scrape that
+	// just ran out its deadline must still get its notifications queued.
+	publishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+
+	if err := store.InsertOutboxEvents(publishCtx, db, events); err != nil {
+		slog.Error("insert outbox events", "count", len(events), "err", err)
+		return
+	}
+	slog.Info("outbox events queued", "count", len(events))
 }
 
 // Courses returns stored courses. Query: ?search=db (DB only), ?search=page (run scraper, sync static course rows, return list), or omit for legacy auto (fill when empty).
@@ -340,6 +370,15 @@ func (c *Controller) Califications(w http.ResponseWriter, r *http.Request) {
 		slog.Error("fetch califications failed", "course_id", *courseViewID, "err", err)
 		http.Error(w, "califications fetch failed", http.StatusBadGateway)
 		return
+	}
+
+	// Persist so a manual call feeds the same grades table and outbox the scheduler uses.
+	courseName := saia.CourseLabelForMoodleID(*courseViewID)
+	events, err := saia.PersistCourseGradeReport(scrapeCtx, c.db, courseName, report)
+	if err != nil {
+		slog.Error("persist califications", "course_id", *courseViewID, "err", err)
+	} else {
+		publishOutboxEvents(scrapeCtx, c.db, events)
 	}
 
 	w.Header().Set("Content-Type", "application/json")

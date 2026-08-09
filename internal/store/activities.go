@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -20,13 +21,13 @@ type Activity struct {
 	// MoodleCourseID is the activity / course-module id from mod URLs (?id=cmid), not the course page id.
 	MoodleCourseID int `json:"moodle_course_id"`
 	// CourseViewID is the Moodle course id from course/view.php?id= (nil if row predates column).
-	CourseViewID *int `json:"course_view_id,omitempty"`
-	CourseName   string          `json:"course_name"`
-	Name         string          `json:"name"`
-	Link         string          `json:"link"`
+	CourseViewID    *int            `json:"course_view_id,omitempty"`
+	CourseName      string          `json:"course_name"`
+	Name            string          `json:"name"`
+	Link            string          `json:"link"`
 	ActivityContent json.RawMessage `json:"activity_content"`
-	CreatedAt    time.Time       `json:"created_at"`
-	UpdatedAt    time.Time       `json:"updated_at"`
+	CreatedAt       time.Time       `json:"created_at"`
+	UpdatedAt       time.Time       `json:"updated_at"`
 }
 
 // ActivityUpsert is one row for the activities table (moodle_course_id = course module id from ?id=).
@@ -38,16 +39,31 @@ type ActivityUpsert struct {
 	ActivityContent json.RawMessage
 }
 
-// UpsertActivities inserts or updates rows by primary key moodle_course_id.
-func UpsertActivities(ctx context.Context, db *sql.DB, rows []ActivityUpsert) error {
+// UpsertActivities inserts or updates rows by primary key moodle_course_id and returns one
+// OutboxEvent per genuinely new or changed activity, tagged with courseName.
+//
+// Change detection compares name and link against the stored row inside the same transaction.
+// It deliberately ignores activity_content, which is re-parsed from HTML on every scrape and so
+// churns constantly. Comparing beats reading RowsAffected(), whose 0/1/2 encoding silently
+// breaks if clientFoundRows=true is ever added to the DSN.
+func UpsertActivities(ctx context.Context, db *sql.DB, rows []ActivityUpsert, courseName string) ([]OutboxEvent, error) {
 	if len(rows) == 0 {
-		return nil
+		return nil, nil
 	}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
+		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	ids := make([]uint32, 0, len(rows))
+	for _, row := range rows {
+		ids = append(ids, row.MoodleCourseID)
+	}
+	existing, err := selectActivityFingerprints(ctx, tx, ids)
+	if err != nil {
+		return nil, err
+	}
 
 	const q = `
 INSERT INTO activities (moodle_course_id, course_view_id, name, link, activity_content)
@@ -60,10 +76,11 @@ ON DUPLICATE KEY UPDATE
 
 	stmt, err := tx.PrepareContext(ctx, q)
 	if err != nil {
-		return fmt.Errorf("prepare upsert: %w", err)
+		return nil, fmt.Errorf("prepare upsert: %w", err)
 	}
 	defer stmt.Close()
 
+	var events []OutboxEvent
 	for _, row := range rows {
 		name := truncateRunes(row.Name, maxActivityNameLen)
 		link := truncateRunes(row.Link, maxActivityLinkLen)
@@ -72,13 +89,82 @@ ON DUPLICATE KEY UPDATE
 			cv = *row.CourseViewID
 		}
 		if _, err := stmt.ExecContext(ctx, row.MoodleCourseID, cv, name, link, row.ActivityContent); err != nil {
-			return fmt.Errorf("upsert activity %d: %w", row.MoodleCourseID, err)
+			return nil, fmt.Errorf("upsert activity %d: %w", row.MoodleCourseID, err)
 		}
+		if ev, ok := activityEvent(existing, row.MoodleCourseID, name, link, row.CourseViewID, courseName); ok {
+			events = append(events, ev)
+		}
+		// Record what we just wrote so a cmid linked twice on the same course page does not
+		// produce two events.
+		existing[row.MoodleCourseID] = activityFingerprint{name: name, link: link}
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit: %w", err)
+		return nil, fmt.Errorf("commit: %w", err)
 	}
-	return nil
+	return events, nil
+}
+
+// activityFingerprint holds the notification-relevant columns of a stored activity.
+type activityFingerprint struct {
+	name string
+	link string
+}
+
+func selectActivityFingerprints(ctx context.Context, tx *sql.Tx, ids []uint32) (map[uint32]activityFingerprint, error) {
+	out := make(map[uint32]activityFingerprint, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	placeholders := make([]string, len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	q := fmt.Sprintf(
+		`SELECT moodle_course_id, name, link FROM activities WHERE moodle_course_id IN (%s)`,
+		strings.Join(placeholders, ","),
+	)
+	rows, err := tx.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("select existing activities: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id uint32
+		var fp activityFingerprint
+		if err := rows.Scan(&id, &fp.name, &fp.link); err != nil {
+			return nil, fmt.Errorf("scan existing activity: %w", err)
+		}
+		out[id] = fp
+	}
+	return out, rows.Err()
+}
+
+func activityEvent(existing map[uint32]activityFingerprint, id uint32, name, link string, courseViewID *uint32, courseName string) (OutboxEvent, bool) {
+	ev := OutboxEvent{
+		EventType:    EventTypeActivity,
+		CourseViewID: courseViewID,
+		CourseName:   courseName,
+		EntityKey:    strconv.FormatUint(uint64(id), 10),
+		Title:        name,
+		URL:          link,
+	}
+	prev, found := existing[id]
+	switch {
+	case !found:
+		ev.ChangeType = ChangeTypeNew
+	case prev.name != name:
+		ev.ChangeType = ChangeTypeUpdated
+		ev.Detail = "Renombrada (antes: " + prev.name + ")"
+	case prev.link != link:
+		ev.ChangeType = ChangeTypeUpdated
+		ev.Detail = "Enlace actualizado"
+	default:
+		return OutboxEvent{}, false
+	}
+	return ev, true
 }
 
 // ListActivities returns activity rows. If courseViewID is non-nil, only rows for that Moodle course id
