@@ -16,6 +16,7 @@ import (
 	"uts_bot/internal/apiauth"
 	"uts_bot/internal/config"
 	"uts_bot/internal/moodlehttp"
+	"uts_bot/internal/pagos"
 	"uts_bot/internal/saia"
 	"uts_bot/internal/store"
 )
@@ -37,6 +38,7 @@ func (c *Controller) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/courses", c.Courses)
 	mux.HandleFunc("/api/v1/activities", c.Activities)
 	mux.HandleFunc("/api/v1/califications", c.Califications)
+	mux.HandleFunc("GET /api/v1/payment-fees", c.PaymentFees)
 	mux.HandleFunc("GET /api/v1/courses/{courseViewID}/attachments", c.CourseAttachmentList)
 	mux.HandleFunc("GET /api/v1/attachments/content", c.AttachmentContent)
 }
@@ -274,6 +276,34 @@ func (c *Controller) Activities(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeActivitiesJSON(w, activities)
+}
+
+// PaymentFees logs into the UFT pagos portal and returns all student installments (cuotas).
+func (c *Controller) PaymentFees(w http.ResponseWriter, r *http.Request) {
+	if !c.requireAPIKey(w, r) {
+		return
+	}
+	slog.Info("endpoint consulted", "endpoint", "/api/v1/payment-fees", "remote_addr", r.RemoteAddr)
+
+	ctx := r.Context()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	scrapeCtx, cancel := detachedScrapeContext(ctx)
+	defer cancel()
+
+	cl := pagos.New(config.PagosAPIBaseURL, config.PagosCI, config.PagosPassword)
+	fees, err := cl.GetPaymentFees(scrapeCtx)
+	if err != nil {
+		slog.Error("fetch payment fees failed", "err", err)
+		http.Error(w, "payment fees fetch failed", http.StatusBadGateway)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(true)
+	_ = enc.Encode(fees)
 }
 
 // Califications returns Moodle grade report rows for one course (?course_id= required, Moodle course/view id).

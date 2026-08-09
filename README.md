@@ -74,14 +74,46 @@ HTTP API for UFT SAIA course/activity sync (Go + MySQL). The Moodle scraper uses
    docker compose down
    ```
 
-### Migrations only (optional)
+### Migrations (local)
 
-If you need to run migrations without bringing up the API:
+SQL files live in [`migrations/`](migrations/) (`NNNN_name.up.sql` / `.down.sql`). Apply them with the [golang-migrate CLI](https://github.com/golang-migrate/migrate/tree/master/cmd/migrate) against your local MySQL (`uft_db`).
 
-```bash
-docker compose up -d db
-docker compose run --rm migrate
-```
+1. **Install the CLI** (pick one):
+
+   ```bash
+   # Go
+   go install -tags 'mysql' github.com/golang-migrate/migrate/v4/cmd/migrate@v4.18.3
+
+   # Or download a release binary from:
+   # https://github.com/golang-migrate/migrate/releases
+   ```
+
+   Ensure `migrate` is on your `PATH` (e.g. `$GOPATH/bin` / `$HOME/go/bin`).
+
+2. **Create the database** if it does not exist yet (example with root):
+
+   ```bash
+   mysql -h 127.0.0.1 -u root -p -e "CREATE DATABASE IF NOT EXISTS uft_db CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+   ```
+
+3. **Run migrations** from the repo root. Use a MySQL URL (not the Go `DATABASE_DSN` form). Replace `USER` / `PASS` / host / port to match your local MySQL:
+
+   ```bash
+   migrate -path=./migrations \
+     -database="mysql://USER:PASS@tcp(127.0.0.1:3306)/uft_db?multiStatements=true&charset=utf8mb4" \
+     up
+   ```
+
+   If the password has special characters (`@`, `#`, `/`, etc.), URL-encode them in the DSN.
+
+4. **Other useful commands** (same `-path` and `-database`):
+
+   ```bash
+   migrate -path=./migrations -database="mysql://USER:PASS@tcp(127.0.0.1:3306)/uft_db?multiStatements=true&charset=utf8mb4" version
+   migrate -path=./migrations -database="mysql://USER:PASS@tcp(127.0.0.1:3306)/uft_db?multiStatements=true&charset=utf8mb4" down 1
+   ```
+
+Match credentials with `DATABASE_DSN` in `.env` so the API can connect to the same schema after `up`.
 
 ### Scraper limitations (HTTP-only)
 
