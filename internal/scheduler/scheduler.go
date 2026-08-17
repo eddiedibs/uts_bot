@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"uts_bot/internal/config"
-	"uts_bot/internal/coursestatic"
 	"uts_bot/internal/moodlehttp"
 	"uts_bot/internal/saia"
 	"uts_bot/internal/store"
@@ -18,6 +17,10 @@ import (
 // wedged: a course page, every activity page linked from it, and every attachment download and
 // parse. It only feeds the deadline calculation; a healthy course finishes well inside it.
 const perCourseWorkAllowance = 5 * time.Minute
+
+// discoveryDeadline bounds how long finding the live course list may take, separate from the
+// per-course crawl budget in cycleDeadline.
+const discoveryDeadline = 2 * time.Minute
 
 // Scheduler runs the Moodle scrape on a timer so the database changes on its own, which is what
 // lets uts_notifier work purely from the outbox instead of poking uts_bot's HTTP API.
@@ -73,7 +76,6 @@ func (s *Scheduler) loop(ctx context.Context) {
 		"rest_between_cycles", config.ScrapeInterval,
 		"rest_between_courses", config.ScrapeCourseRest,
 		"rest_between_phases", config.ScrapePhaseRest,
-		"cycle_deadline", cycleDeadline(),
 		"active_hours", [2]int{config.ScrapeActiveStartHour, config.ScrapeActiveEndHour},
 		"outbox_retention_days", config.OutboxRetentionDays,
 	)
@@ -120,23 +122,20 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 
 // cycleDeadline budgets every rest in a cycle plus a working allowance for each course, in both
 // the activities and grades phases. Deriving it means raising a rest cannot silently start
-// truncating cycles.
-func cycleDeadline() time.Duration {
-	n := time.Duration(len(coursestatic.UFTMoodleCourses))
+// truncating cycles. n is the course count for this cycle, discovered fresh each time.
+func cycleDeadline(n int) time.Duration {
 	if n == 0 {
 		return perCourseWorkAllowance
 	}
-	rests := (n-1)*config.ScrapeCourseRest + config.ScrapePhaseRest
-	return rests + 2*n*perCourseWorkAllowance
+	nn := time.Duration(n)
+	rests := (nn-1)*config.ScrapeCourseRest + config.ScrapePhaseRest
+	return rests + 2*nn*perCourseWorkAllowance
 }
 
-// runCycle walks every course for activities, rests, then collects grade reports. All detected
-// changes are published in a single transaction at the end so the notifier sees the cycle as one
-// atomic batch and sends one grouped message.
+// runCycle discovers the live course list, walks every course for activities, rests, then
+// collects grade reports. All detected changes are published in a single transaction at the end
+// so the notifier sees the cycle as one atomic batch and sends one grouped message.
 func (s *Scheduler) runCycle(ctx context.Context) {
-	cycleCtx, cancel := context.WithTimeout(ctx, cycleDeadline())
-	defer cancel()
-
 	started := time.Now()
 	sc := saia.New(moodlehttp.New())
 	sc.DB = s.db
@@ -145,20 +144,80 @@ func (s *Scheduler) runCycle(ctx context.Context) {
 	// already committed, so dropping their events would lose those notifications for good.
 	defer func() { s.publish(ctx, sc.TakeEvents(), started) }()
 
-	if !s.scrapeActivities(cycleCtx, sc) {
+	courses := s.discoverCourses(ctx, sc)
+	if len(courses) == 0 {
+		slog.Warn("scrape cycle skipped: no courses to crawl")
+		return
+	}
+
+	cycleCtx, cancel := context.WithTimeout(ctx, cycleDeadline(len(courses)))
+	defer cancel()
+
+	if !s.scrapeActivities(cycleCtx, sc, courses) {
 		return
 	}
 	if !sleepCtx(cycleCtx, config.ScrapePhaseRest) {
 		return
 	}
-	s.scrapeGrades(cycleCtx, sc)
+	s.scrapeGrades(cycleCtx, sc, courses)
+}
+
+// discoverCourses logs in, finds the live course list on the Moodle dashboard, and syncs it into
+// the DB: newly enrolled courses are added, and ones no longer visible (term ended, unenrolled)
+// are deleted along with their activities and grades. On failure it falls back to the last-known
+// DB rows so a transient Moodle hiccup does not stall the whole cycle.
+func (s *Scheduler) discoverCourses(ctx context.Context, sc *saia.SAIA) []store.Course {
+	discoverCtx, cancel := context.WithTimeout(ctx, discoveryDeadline)
+	defer cancel()
+
+	var courses []store.Course
+	s.underScrapeLock(func() {
+		discovered, err := sc.DiscoverCourses(discoverCtx, config.SAIAPage)
+		if err != nil {
+			slog.Error("course discovery failed, using last known courses", "err", err)
+			courses, err = store.ListCourses(ctx, s.db)
+			if err != nil {
+				slog.Error("list courses fallback", "err", err)
+			}
+			return
+		}
+		courses = discovered
+		s.syncCourses(ctx, discovered)
+	})
+	return courses
+}
+
+// syncCourses commits discovered as the new course set. Failures are logged, not fatal: the
+// scrape still proceeds against the freshly discovered list even if the DB write did not stick.
+func (s *Scheduler) syncCourses(ctx context.Context, discovered []store.Course) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		slog.Error("begin tx for course sync", "err", err)
+		return
+	}
+	defer tx.Rollback()
+	added, removed, guardSkipped, err := store.SyncCourses(ctx, tx, discovered)
+	if err != nil {
+		slog.Error("sync courses", "err", err)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		slog.Error("commit course sync", "err", err)
+		return
+	}
+	if guardSkipped {
+		slog.Warn("course sync deletions withheld: discovered list looked partial", "discovered", len(discovered))
+	}
+	if len(added) > 0 || len(removed) > 0 {
+		slog.Info("course list synced", "added", len(added), "removed", len(removed))
+	}
 }
 
 // scrapeActivities crawls one course at a time, resting between them. It deliberately avoids
 // saia.Run's all-courses mode so the requests are spread out instead of arriving back to back.
 // Returns false if the cycle was cut short.
-func (s *Scheduler) scrapeActivities(ctx context.Context, sc *saia.SAIA) bool {
-	for i, course := range coursestatic.UFTMoodleCourses {
+func (s *Scheduler) scrapeActivities(ctx context.Context, sc *saia.SAIA, courses []store.Course) bool {
+	for i, course := range courses {
 		if i > 0 && !sleepCtx(ctx, config.ScrapeCourseRest) {
 			slog.Warn("scrape cycle ended during activities", "completed_courses", i)
 			return false
@@ -166,7 +225,7 @@ func (s *Scheduler) scrapeActivities(ctx context.Context, sc *saia.SAIA) bool {
 		courseViewID := course.MoodleID
 		s.underScrapeLock(func() {
 			slog.Info("scraping course activities", "course", course.Name, "moodle_id", courseViewID)
-			if err := sc.Run(ctx, config.SAIAPage, &courseViewID); err != nil {
+			if err := sc.Run(ctx, config.SAIAPage, nil, &courseViewID); err != nil {
 				slog.Error("scheduled activities scrape failed", "course", course.Name, "err", err)
 			}
 		})
@@ -176,9 +235,9 @@ func (s *Scheduler) scrapeActivities(ctx context.Context, sc *saia.SAIA) bool {
 
 // scrapeGrades collects every course's grade report back to back under a single lock hold. Grade
 // reports are two cheap page loads each, so they do not need the pacing the activity crawl does.
-func (s *Scheduler) scrapeGrades(ctx context.Context, sc *saia.SAIA) {
+func (s *Scheduler) scrapeGrades(ctx context.Context, sc *saia.SAIA, courses []store.Course) {
 	s.underScrapeLock(func() {
-		for _, course := range coursestatic.UFTMoodleCourses {
+		for _, course := range courses {
 			if ctx.Err() != nil {
 				slog.Warn("scrape cycle ended during grades", "course", course.Name)
 				return

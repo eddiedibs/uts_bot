@@ -2,6 +2,7 @@ package config
 
 import (
 	"log/slog"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -17,6 +18,10 @@ var (
 	Password            string
 	// CourseViewBaseURL is the Moodle course page without query string, e.g. …/course/view.php
 	CourseViewBaseURL string
+	// DashboardURL is the Moodle page listing every enrolled course, used to auto-discover the
+	// live course list on each crawl (DASHBOARD_URL). Defaults to the SAIA host's
+	// /my/courses.php.
+	DashboardURL string
 	// DatabaseDSN is a MySQL DSN, e.g. user:pass@tcp(127.0.0.1:3306)/uft_db?parseTime=true
 	DatabaseDSN string
 	// APIListenAddr is the HTTP listen address (e.g. :8080).
@@ -65,6 +70,7 @@ func init() {
 	Username = os.Getenv("UTS_USERNAME")
 	Password = os.Getenv("UTS_PASSWORD")
 	CourseViewBaseURL = strings.TrimSuffix(getEnvOr("COURSE_VIEW_BASE_URL", "https://saia.uft.edu.ve/course/view.php"), "?")
+	DashboardURL = getEnvOr("DASHBOARD_URL", defaultDashboardURL(SAIAPage))
 	DatabaseDSN = os.Getenv("DATABASE_DSN")
 	APIListenAddr = getEnvOr("API_LISTEN", ":8080")
 	APIKey = strings.TrimSpace(os.Getenv("API_KEY"))
@@ -78,6 +84,19 @@ func init() {
 	ScrapePhaseRest = getEnvDuration("SCRAPE_PHASE_REST", 5*time.Minute)
 	ScrapeActiveStartHour, ScrapeActiveEndHour = parseActiveHours(getEnvOr("SCRAPE_ACTIVE_HOURS", "7-23"))
 	OutboxRetentionDays = getEnvInt("OUTBOX_RETENTION_DAYS", 14)
+}
+
+// defaultDashboardURL derives the Moodle "my courses" page from the SAIA host so a bare
+// DASHBOARD_URL override is only needed when a site uses a non-standard path.
+func defaultDashboardURL(saiaPage string) string {
+	u, err := url.Parse(saiaPage)
+	if err != nil || u.Host == "" {
+		return strings.TrimSuffix(saiaPage, "/") + "/my/courses.php"
+	}
+	u.Path = "/my/courses.php"
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String()
 }
 
 func getEnvOr(key, fallback string) string {

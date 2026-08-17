@@ -101,20 +101,54 @@ func parseOptionalCourseViewID(r *http.Request) (*int, error) {
 	return &x, nil
 }
 
-// runScraper logs into SAIA and walks courses/activities (Excel export side effects today).
-func (c *Controller) runScraper(ctx context.Context) error {
-	cl := moodlehttp.New()
-	s := saia.New(cl)
-	return s.Run(ctx, config.SAIAPage, nil)
+// discoverAndSyncCourses logs in, discovers the live Moodle course list, and syncs it into the
+// DB: new courses are added, and ones no longer visible (term ended, unenrolled) are deleted
+// along with their activities and grades. Falls back to the last-known DB rows if discovery
+// itself fails, so a transient Moodle hiccup does not stop the crawl.
+func (c *Controller) discoverAndSyncCourses(ctx context.Context, s *saia.SAIA) ([]store.Course, error) {
+	discovered, err := s.DiscoverCourses(ctx, config.SAIAPage)
+	if err != nil {
+		slog.Warn("course discovery failed, using last known courses", "err", err)
+		return store.ListCourses(ctx, c.db)
+	}
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+	added, removed, guardSkipped, err := store.SyncCourses(ctx, tx, discovered)
+	if err != nil {
+		return nil, fmt.Errorf("sync courses: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit course sync: %w", err)
+	}
+	if guardSkipped {
+		slog.Warn("course sync deletions withheld: discovered list looked partial", "discovered", len(discovered))
+	}
+	if len(added) > 0 || len(removed) > 0 {
+		slog.Info("course list synced", "added", len(added), "removed", len(removed))
+	}
+	return discovered, nil
 }
 
 // runActivitiesScraper runs Run then getSAIAActivities on the same HTTP session.
-// onlyCourseViewID limits the crawl to one course when non-nil (search=page only).
+// onlyCourseViewID limits the crawl to one course when non-nil (search=page only); a full crawl
+// first discovers/syncs the live course list.
 func (c *Controller) runActivitiesScraper(ctx context.Context, onlyCourseViewID *int) error {
 	cl := moodlehttp.New()
 	s := saia.New(cl)
 	s.DB = c.db
-	err := s.RunThenGetSAIAActivities(ctx, config.SAIAPage, onlyCourseViewID)
+
+	var courses []store.Course
+	if onlyCourseViewID == nil {
+		var err error
+		courses, err = c.discoverAndSyncCourses(ctx, s)
+		if err != nil {
+			return err
+		}
+	}
+	err := s.RunThenGetSAIAActivities(ctx, config.SAIAPage, courses, onlyCourseViewID)
 	// Publish whatever was detected even on a partial failure: the rows are already committed,
 	// so dropping the events would lose those notifications permanently.
 	publishOutboxEvents(ctx, c.db, s.TakeEvents())
@@ -140,7 +174,10 @@ func publishOutboxEvents(ctx context.Context, db *sql.DB, events []store.OutboxE
 	slog.Info("outbox events queued", "count", len(events))
 }
 
-// Courses returns stored courses. Query: ?search=db (DB only), ?search=page (run scraper, sync static course rows, return list), or omit for legacy auto (fill when empty).
+// Courses returns stored courses. Query: ?search=db (DB only, no crawl), ?search=page (discover
+// the live course list from Moodle, sync it into the DB — adding new courses and deleting ones
+// no longer seen — then return it), or omit for legacy auto (fast path when rows exist,
+// otherwise discover+sync once).
 func (c *Controller) Courses(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -158,105 +195,43 @@ func (c *Controller) Courses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	courses, err := store.ListCourses(ctx, c.db)
-	if err != nil {
-		slog.Error("list courses", "err", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
 
-	switch mode {
-	case "db":
-		writeCoursesJSON(w, courses)
-		return
-	case "page":
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		scrapeCtx, cancel := detachedScrapeContext(ctx)
-		defer cancel()
-		if err := c.runScraper(scrapeCtx); err != nil {
-			slog.Error("saia sync failed", "err", err)
-			http.Error(w, "course sync failed", http.StatusBadGateway)
-			return
-		}
-		tx, err := c.db.BeginTx(scrapeCtx, nil)
+	if mode == "db" {
+		courses, err := store.ListCourses(ctx, c.db)
 		if err != nil {
-			slog.Error("begin tx", "err", err)
+			slog.Error("list courses", "err", err)
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
-		defer tx.Rollback()
-		if err := store.SeedCoursesFromStatic(scrapeCtx, tx); err != nil {
-			slog.Error("seed courses", "err", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
-			return
-		}
-		if err := tx.Commit(); err != nil {
-			slog.Error("commit", "err", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
-			return
-		}
-		courses, err = store.ListCourses(scrapeCtx, c.db)
+		writeCoursesJSON(w, courses)
+		return
+	}
+
+	if mode == searchModeAuto {
+		courses, err := store.ListCourses(ctx, c.db)
 		if err != nil {
-			slog.Error("list courses after page sync", "err", err)
+			slog.Error("list courses", "err", err)
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
-		writeCoursesJSON(w, courses)
-		return
+		if len(courses) > 0 {
+			writeCoursesJSON(w, courses)
+			return
+		}
 	}
 
-	// searchModeAuto — same as before: fast path when rows exist; otherwise scrape + seed once.
-	if len(courses) > 0 {
-		writeCoursesJSON(w, courses)
-		return
-	}
-
+	// mode == "page", or searchModeAuto with an empty DB: discover the live list and sync it.
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	courses, err = store.ListCourses(ctx, c.db)
-	if err != nil {
-		slog.Error("list courses after lock", "err", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	if len(courses) > 0 {
-		writeCoursesJSON(w, courses)
-		return
-	}
-
 	scrapeCtx, cancel := detachedScrapeContext(ctx)
 	defer cancel()
-	if err := c.runScraper(scrapeCtx); err != nil {
-		slog.Error("saia sync failed", "err", err)
+
+	cl := moodlehttp.New()
+	s := saia.New(cl)
+	courses, err := c.discoverAndSyncCourses(scrapeCtx, s)
+	if err != nil {
+		slog.Error("course discovery failed", "err", err)
 		http.Error(w, "course sync failed", http.StatusBadGateway)
-		return
-	}
-
-	tx, err := c.db.BeginTx(scrapeCtx, nil)
-	if err != nil {
-		slog.Error("begin tx", "err", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	defer tx.Rollback()
-
-	if err := store.SeedCoursesFromStatic(scrapeCtx, tx); err != nil {
-		slog.Error("seed courses", "err", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	if err := tx.Commit(); err != nil {
-		slog.Error("commit", "err", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-
-	courses, err = store.ListCourses(scrapeCtx, c.db)
-	if err != nil {
-		slog.Error("list courses after seed", "err", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	writeCoursesJSON(w, courses)
@@ -373,7 +348,7 @@ func (c *Controller) Califications(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Persist so a manual call feeds the same grades table and outbox the scheduler uses.
-	courseName := saia.CourseLabelForMoodleID(*courseViewID)
+	courseName := saia.CourseLabelForMoodleID(scrapeCtx, c.db, *courseViewID)
 	events, err := saia.PersistCourseGradeReport(scrapeCtx, c.db, courseName, report)
 	if err != nil {
 		slog.Error("persist califications", "course_id", *courseViewID, "err", err)

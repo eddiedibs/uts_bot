@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"uts_bot/internal/config"
-	"uts_bot/internal/coursestatic"
 )
 
 func TestCycleDeadlineCoversEveryRest(t *testing.T) {
@@ -18,18 +17,18 @@ func TestCycleDeadlineCoversEveryRest(t *testing.T) {
 	config.ScrapeCourseRest = 2 * time.Minute
 	config.ScrapePhaseRest = 5 * time.Minute
 
-	n := time.Duration(len(coursestatic.UFTMoodleCourses))
+	const n = 7
 	restsAlone := (n-1)*config.ScrapeCourseRest + config.ScrapePhaseRest
 
-	got := cycleDeadline()
+	got := cycleDeadline(n)
 	if got <= restsAlone {
-		t.Fatalf("cycleDeadline() = %v, which leaves no time for actual work beyond %v of rests", got, restsAlone)
+		t.Fatalf("cycleDeadline(%d) = %v, which leaves no time for actual work beyond %v of rests", n, got, restsAlone)
 	}
 
 	// Raising a rest must push the deadline out, or long rests would truncate cycles silently.
 	config.ScrapeCourseRest = 10 * time.Minute
-	if raised := cycleDeadline(); raised <= got {
-		t.Fatalf("cycleDeadline() = %v after raising the per-course rest, want more than %v", raised, got)
+	if raised := cycleDeadline(n); raised <= got {
+		t.Fatalf("cycleDeadline(%d) = %v after raising the per-course rest, want more than %v", n, raised, got)
 	}
 }
 

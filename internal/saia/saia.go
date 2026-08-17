@@ -17,7 +17,6 @@ import (
 	"github.com/PuerkitoBio/goquery"
 
 	"uts_bot/internal/config"
-	"uts_bot/internal/coursestatic"
 	"uts_bot/internal/docparse"
 	"uts_bot/internal/excel"
 	"uts_bot/internal/moodlehttp"
@@ -50,33 +49,111 @@ func (s *SAIA) TakeEvents() []store.OutboxEvent {
 	return events
 }
 
-// Run logs in, walks courses (all static courses, or only onlyCourseViewID when set), persists activity links when DB is set, and syncs Excel deadlines.
-func (s *SAIA) Run(ctx context.Context, targetPage string, onlyCourseViewID *int) error {
+// Run logs in, walks courses (every course in courses, or only onlyCourseViewID when set),
+// persists activity links when DB is set, and syncs Excel deadlines. courses is ignored when
+// onlyCourseViewID is set.
+func (s *SAIA) Run(ctx context.Context, targetPage string, courses []store.Course, onlyCourseViewID *int) error {
 	if err := s.c.LoginMoodle(ctx, targetPage, config.Username, config.Password); err != nil {
 		return fmt.Errorf("moodle login: %w", err)
 	}
 
 	if onlyCourseViewID != nil {
-		name := CourseLabelForMoodleID(*onlyCourseViewID)
+		name := CourseLabelForMoodleID(ctx, s.DB, *onlyCourseViewID)
 		s.processCoursePage(ctx, name, *onlyCourseViewID)
 		return nil
 	}
 
-	for _, course := range coursestatic.UFTMoodleCourses {
+	for _, course := range courses {
 		s.processCoursePage(ctx, course.Name, course.MoodleID)
 	}
 	return nil
 }
 
-// CourseLabelForMoodleID resolves a human course name from the static course list, falling back
-// to a generic label so notifications never show a bare id.
-func CourseLabelForMoodleID(moodleCourseID int) string {
-	for _, c := range coursestatic.UFTMoodleCourses {
-		if c.MoodleID == moodleCourseID {
-			return c.Name
+// CourseLabelForMoodleID resolves a human course name from the DB, falling back to a generic
+// label so notifications never show a bare id.
+func CourseLabelForMoodleID(ctx context.Context, db *sql.DB, moodleCourseID int) string {
+	if db != nil {
+		if name, err := store.CourseNameByMoodleID(ctx, db, moodleCourseID); err == nil && name != "" {
+			return name
 		}
 	}
 	return fmt.Sprintf("course %d", moodleCourseID)
+}
+
+// DiscoverCourses logs in and returns every course visible on the Moodle dashboard, by scanning
+// links to course/view.php?id= anywhere on the page. This is the live source of truth for which
+// courses exist; callers sync it into the DB with store.SyncCourses.
+func (s *SAIA) DiscoverCourses(ctx context.Context, targetPage string) ([]store.Course, error) {
+	if err := s.c.LoginMoodle(ctx, targetPage, config.Username, config.Password); err != nil {
+		return nil, fmt.Errorf("moodle login: %w", err)
+	}
+	body, err := s.c.Get(ctx, config.DashboardURL)
+	if err != nil {
+		return nil, fmt.Errorf("get dashboard %s: %w", config.DashboardURL, err)
+	}
+	courses, err := parseCourseLinks(body)
+	if err != nil {
+		return nil, fmt.Errorf("parse dashboard: %w", err)
+	}
+	if len(courses) == 0 {
+		return nil, fmt.Errorf("no courses found on dashboard %s", config.DashboardURL)
+	}
+	return courses, nil
+}
+
+// parseCourseLinks scans HTML for links to course/view.php?id=N and returns one Course per
+// distinct id, in document order.
+func parseCourseLinks(html []byte) ([]store.Course, error) {
+	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(html))
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[int]bool)
+	var out []store.Course
+	doc.Find(`a[href*="course/view.php"]`).Each(func(_ int, a *goquery.Selection) {
+		href, _ := a.Attr("href")
+		id, ok := courseViewIDFromHref(href)
+		if !ok || seen[id] {
+			return
+		}
+		name := courseLinkName(a)
+		if name == "" {
+			return
+		}
+		seen[id] = true
+		out = append(out, store.Course{MoodleID: id, Name: name})
+	})
+	return out, nil
+}
+
+func courseViewIDFromHref(raw string) (int, bool) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return 0, false
+	}
+	idStr := u.Query().Get("id")
+	if idStr == "" {
+		return 0, false
+	}
+	v, err := strconv.ParseUint(idStr, 10, 31)
+	if err != nil || v == 0 {
+		return 0, false
+	}
+	return int(v), true
+}
+
+// courseLinkName prefers an explicit label (title/aria-label) over the link's visible text,
+// since Moodle course cards often nest extra screen-reader-only text inside the link that would
+// otherwise get concatenated into the name.
+func courseLinkName(a *goquery.Selection) string {
+	for _, attr := range []string{"title", "aria-label"} {
+		if v, ok := a.Attr(attr); ok {
+			if name := collapseWhitespace(v); name != "" {
+				return name
+			}
+		}
+	}
+	return collapseWhitespace(a.Text())
 }
 
 func (s *SAIA) processCoursePage(ctx context.Context, courseName string, moodleCourseID int) {
@@ -108,8 +185,8 @@ func (s *SAIA) processCoursePage(ctx context.Context, courseName string, moodleC
 
 // RunThenGetSAIAActivities runs the full SAIA crawl (Run), then runs getSAIAActivities
 // again on the last fetched course page. Used by the /activities API.
-func (s *SAIA) RunThenGetSAIAActivities(ctx context.Context, targetPage string, onlyCourseViewID *int) error {
-	if err := s.Run(ctx, targetPage, onlyCourseViewID); err != nil {
+func (s *SAIA) RunThenGetSAIAActivities(ctx context.Context, targetPage string, courses []store.Course, onlyCourseViewID *int) error {
+	if err := s.Run(ctx, targetPage, courses, onlyCourseViewID); err != nil {
 		return fmt.Errorf("run: %w", err)
 	}
 	if len(s.lastCourseHTML) == 0 {
