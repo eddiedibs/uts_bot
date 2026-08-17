@@ -196,7 +196,7 @@ func (s *Scheduler) syncCourses(ctx context.Context, discovered []store.Course) 
 		return
 	}
 	defer tx.Rollback()
-	added, removed, guardSkipped, err := store.SyncCourses(ctx, tx, discovered)
+	added, removed, stillMissing, guardSkipped, err := store.SyncCourses(ctx, tx, discovered)
 	if err != nil {
 		slog.Error("sync courses", "err", err)
 		return
@@ -210,6 +210,13 @@ func (s *Scheduler) syncCourses(ctx context.Context, discovered []store.Course) 
 	}
 	if len(added) > 0 || len(removed) > 0 {
 		slog.Info("course list synced", "added", len(added), "removed", len(removed))
+	}
+	if len(stillMissing) > 0 {
+		names := make([]string, len(stillMissing))
+		for i, c := range stillMissing {
+			names[i] = c.Name
+		}
+		slog.Warn("course missing from discovery this cycle, not yet pruned", "courses", names)
 	}
 }
 
