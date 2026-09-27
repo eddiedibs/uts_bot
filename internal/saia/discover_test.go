@@ -1,6 +1,19 @@
 package saia
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+func TestCourseTimelineClassificationIsInProgress(t *testing.T) {
+	t.Parallel()
+
+	// Crawl/sync must use Moodle's active enrollment set. "all" includes past courses and
+	// produces DEADLINE NOT FOUND spam when activities on ended courses are fetched.
+	if courseTimelineInProgress != "inprogress" {
+		t.Fatalf("courseTimelineInProgress = %q, want %q", courseTimelineInProgress, "inprogress")
+	}
+}
 
 func TestParseCourseLinksDedupesByID(t *testing.T) {
 	t.Parallel()
@@ -54,6 +67,78 @@ func TestParseCourseLinksDedupesByID(t *testing.T) {
 		if c.Name != wantName {
 			t.Errorf("course %d name = %q, want %q", c.MoodleID, c.Name, wantName)
 		}
+	}
+}
+
+func TestParseCourseLinksFromMyoverviewCard(t *testing.T) {
+	t.Parallel()
+
+	html := []byte(`
+<div class="card course-card" data-region="course-content" data-course-id="24203">
+  <a href="https://saia.uft.edu.ve/course/view.php?id=24203" tabindex="-1">
+    <span class="visually-hidden"> Gerencia, Liderazgo y Emprendimiento </span>
+  </a>
+  <a href="https://saia.uft.edu.ve/course/view.php?id=24203" class="aalink coursename">
+    <span class="multiline" title=" Gerencia, Liderazgo y Emprendimiento (Por Competencia)">
+      Gerencia, Liderazgo y Emprendimiento (Por ...
+    </span>
+  </a>
+</div>
+`)
+	got, err := parseCourseLinks(html)
+	if err != nil {
+		t.Fatalf("parseCourseLinks: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d courses, want 1: %+v", len(got), got)
+	}
+	if got[0].MoodleID != 24203 {
+		t.Errorf("id = %d, want 24203", got[0].MoodleID)
+	}
+	if !strings.Contains(got[0].Name, "Gerencia") {
+		t.Errorf("name = %q, want Gerencia…", got[0].Name)
+	}
+}
+
+func TestParseEnrolledCoursesAjax(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`[{
+		"error": false,
+		"data": {
+			"courses": [
+				{"id": 24203, "fullname": "Gerencia", "shortname": "GER"},
+				{"id": 24526, "fullname": "Computacion para Ingenieros", "shortname": "COMP"}
+			],
+			"nextoffset": 2
+		}
+	}]`)
+	got, next, err := parseEnrolledCoursesAjax(body)
+	if err != nil {
+		t.Fatalf("parseEnrolledCoursesAjax: %v", err)
+	}
+	if next != 2 {
+		t.Errorf("nextoffset = %d, want 2", next)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d courses, want 2", len(got))
+	}
+	if got[0].MoodleID != 24203 || got[0].Name != "Gerencia" {
+		t.Errorf("first = %+v", got[0])
+	}
+}
+
+func TestExtractSesskey(t *testing.T) {
+	t.Parallel()
+
+	html := []byte(`<html><script>M.cfg = {"wwwroot":"https://saia.uft.edu.ve","sesskey":"ChRMaoEbkb"};</script>
+<a href="https://saia.uft.edu.ve/login/logout.php?sesskey=OTHER">Cerrar sesión</a></html>`)
+	got, err := extractSesskey(html)
+	if err != nil {
+		t.Fatalf("extractSesskey: %v", err)
+	}
+	if got != "ChRMaoEbkb" {
+		t.Errorf("sesskey = %q, want ChRMaoEbkb", got)
 	}
 }
 

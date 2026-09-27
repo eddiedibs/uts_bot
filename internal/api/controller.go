@@ -101,10 +101,11 @@ func parseOptionalCourseViewID(r *http.Request) (*int, error) {
 	return &x, nil
 }
 
-// discoverAndSyncCourses logs in, discovers the live Moodle course list, and syncs it into the
-// DB: new courses are added, and ones no longer visible (term ended, unenrolled) are deleted
-// along with their activities and grades. Falls back to the last-known DB rows if discovery
-// itself fails, so a transient Moodle hiccup does not stop the crawl.
+// discoverAndSyncCourses logs in, discovers Moodle's in-progress (active) enrolled courses,
+// and syncs that set into the DB: new courses are added, and ones no longer in progress
+// (term ended, unenrolled) are deleted along with their activities and grades after a miss
+// streak. Falls back to the last-known DB rows if discovery itself fails, so a transient
+// Moodle hiccup does not stop the crawl.
 func (c *Controller) discoverAndSyncCourses(ctx context.Context, s *saia.SAIA) ([]store.Course, error) {
 	discovered, err := s.DiscoverCourses(ctx, config.SAIAPage)
 	if err != nil {
@@ -194,7 +195,7 @@ func (c *Controller) Courses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slog.Info("endpoint consulted", "endpoint", "/api/v1/courses", "remote_addr", r.RemoteAddr, "search", r.URL.Query().Get("search"))
-
+	
 	mode, err := parseSearchQuery(r, searchModeAuto)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -204,6 +205,7 @@ func (c *Controller) Courses(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	if mode == "db" {
+		slog.Info("courses mode", "mode", "db", "endpoint", "/api/v1/courses")
 		courses, err := store.ListCourses(ctx, c.db)
 		if err != nil {
 			slog.Error("list courses", "err", err)
@@ -222,12 +224,14 @@ func (c *Controller) Courses(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if len(courses) > 0 {
+			slog.Info("courses mode", "mode", "db", "reason", "auto_nonempty", "endpoint", "/api/v1/courses")
 			writeCoursesJSON(w, courses)
 			return
 		}
 	}
 
 	// mode == "page", or searchModeAuto with an empty DB: discover the live list and sync it.
+	slog.Info("courses mode", "mode", "page", "endpoint", "/api/v1/courses", "search", mode)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	scrapeCtx, cancel := detachedScrapeContext(ctx)

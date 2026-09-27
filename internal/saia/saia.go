@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/url"
 	"path"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -80,9 +81,19 @@ func CourseLabelForMoodleID(ctx context.Context, db *sql.DB, moodleCourseID int)
 	return fmt.Sprintf("course %d", moodleCourseID)
 }
 
-// DiscoverCourses logs in and returns every course visible on the Moodle dashboard, by scanning
-// links to course/view.php?id= anywhere on the page. This is the live source of truth for which
-// courses exist; callers sync it into the DB with store.SyncCourses.
+// courseTimelineInProgress is Moodle's myoverview classification for courses that have
+// started, are not complete, and have not passed their end date. Using "all" also returns
+// past enrollments; crawling those activities yields DEADLINE NOT FOUND spam because ended
+// courses no longer expose assignment deadline markup.
+const courseTimelineInProgress = "inprogress"
+
+// DiscoverCourses logs in and returns enrolled courses Moodle classifies as in progress
+// (active). Past and future courses are excluded so activity/deadline crawls skip dead terms.
+//
+// Moodle's "Mis cursos" / myoverview block often ships an empty HTML shell and fills cards
+// via AJAX (core_course_get_enrolled_courses_by_timeline_classification). That AJAX call is
+// preferred because it honors timeline classification; dashboard SSR links (when present)
+// are only a fallback if AJAX fails.
 func (s *SAIA) DiscoverCourses(ctx context.Context, targetPage string) ([]store.Course, error) {
 	if err := s.c.LoginMoodle(ctx, targetPage, config.Username, config.Password); err != nil {
 		return nil, fmt.Errorf("moodle login: %w", err)
@@ -91,18 +102,173 @@ func (s *SAIA) DiscoverCourses(ctx context.Context, targetPage string) ([]store.
 	if err != nil {
 		return nil, fmt.Errorf("get dashboard %s: %w", config.DashboardURL, err)
 	}
-	courses, err := parseCourseLinks(body)
+
+	courses, ajaxErr := s.discoverCoursesViaAjax(ctx, body)
+	if ajaxErr == nil {
+		if len(courses) == 0 {
+			return nil, fmt.Errorf("no in-progress courses on dashboard %s", config.DashboardURL)
+		}
+		return courses, nil
+	}
+	slog.Warn("ajax in-progress course discovery failed; falling back to dashboard HTML",
+		"err", ajaxErr, "dashboard", config.DashboardURL)
+
+	courses, err = parseCourseLinks(body)
 	if err != nil {
 		return nil, fmt.Errorf("parse dashboard: %w", err)
 	}
 	if len(courses) == 0 {
-		return nil, fmt.Errorf("no courses found on dashboard %s", config.DashboardURL)
+		return nil, fmt.Errorf("no courses found on dashboard %s (ajax: %v)", config.DashboardURL, ajaxErr)
 	}
 	return courses, nil
 }
 
+func (s *SAIA) discoverCoursesViaAjax(ctx context.Context, dashboardHTML []byte) ([]store.Course, error) {
+	sesskey, err := extractSesskey(dashboardHTML)
+	if err != nil {
+		return nil, fmt.Errorf("dashboard sesskey: %w", err)
+	}
+	base, err := moodleOrigin(config.DashboardURL)
+	if err != nil {
+		return nil, err
+	}
+	ajaxURL := base + "/lib/ajax/service.php?sesskey=" + url.QueryEscape(sesskey) +
+		"&info=core_course_get_enrolled_courses_by_timeline_classification"
+
+	var out []store.Course
+	seen := make(map[int]bool)
+	offset := 0
+	for {
+		payload := []map[string]any{{
+			"index":      0,
+			"methodname": "core_course_get_enrolled_courses_by_timeline_classification",
+			"args": map[string]any{
+				"offset":           offset,
+				"limit":            48,
+				"classification":   courseTimelineInProgress,
+				"sort":             "fullname",
+				"customfieldname":  "",
+				"customfieldvalue": "",
+			},
+		}}
+		body, err := s.c.PostJSON(ctx, ajaxURL, payload)
+		if err != nil {
+			return nil, fmt.Errorf("ajax enrolled courses (offset=%d): %w", offset, err)
+		}
+		batch, next, err := parseEnrolledCoursesAjax(body)
+		if err != nil {
+			return nil, fmt.Errorf("ajax enrolled courses decode (offset=%d): %w", offset, err)
+		}
+		for _, c := range batch {
+			if seen[c.MoodleID] {
+				continue
+			}
+			seen[c.MoodleID] = true
+			out = append(out, c)
+		}
+		if len(batch) == 0 || next <= offset || next == 0 {
+			break
+		}
+		offset = next
+		if offset > 10000 {
+			break
+		}
+	}
+	return out, nil
+}
+
+func moodleOrigin(dashboardURL string) (string, error) {
+	u, err := url.Parse(dashboardURL)
+	if err != nil {
+		return "", fmt.Errorf("parse dashboard url: %w", err)
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return "", fmt.Errorf("dashboard url missing scheme/host: %s", dashboardURL)
+	}
+	return u.Scheme + "://" + u.Host, nil
+}
+
+func extractSesskey(html []byte) (string, error) {
+	// Prefer M.cfg.sesskey from the Moodle page bootstrap.
+	if m := sesskeyCfgRe.FindSubmatch(html); len(m) == 2 {
+		return string(m[1]), nil
+	}
+	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(html))
+	if err != nil {
+		return "", err
+	}
+	if v, ok := doc.Find(`input[name="sesskey"]`).First().Attr("value"); ok && v != "" {
+		return v, nil
+	}
+	href, _ := doc.Find(`a[href*="logout.php"][href*="sesskey="]`).First().Attr("href")
+	if href != "" {
+		u, err := url.Parse(href)
+		if err == nil {
+			if sk := u.Query().Get("sesskey"); sk != "" {
+				return sk, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("sesskey not found in dashboard HTML")
+}
+
+var sesskeyCfgRe = regexp.MustCompile(`"sesskey"\s*:\s*"([^"]+)"`)
+
+type enrolledCoursesAjaxItem struct {
+	Error  bool `json:"error"`
+	Data   *struct {
+		Courses []struct {
+			ID        int    `json:"id"`
+			Fullname  string `json:"fullname"`
+			Shortname string `json:"shortname"`
+		} `json:"courses"`
+		NextOffset int `json:"nextoffset"`
+	} `json:"data"`
+	Exception string `json:"exception"`
+	Message   string `json:"message"`
+}
+
+func parseEnrolledCoursesAjax(body []byte) ([]store.Course, int, error) {
+	var items []enrolledCoursesAjaxItem
+	if err := json.Unmarshal(body, &items); err != nil {
+		return nil, 0, err
+	}
+	if len(items) == 0 {
+		return nil, 0, fmt.Errorf("empty ajax response")
+	}
+	item := items[0]
+	if item.Error {
+		msg := item.Message
+		if msg == "" {
+			msg = item.Exception
+		}
+		if msg == "" {
+			msg = "unknown ajax error"
+		}
+		return nil, 0, fmt.Errorf("%s", msg)
+	}
+	if item.Data == nil {
+		return nil, 0, fmt.Errorf("ajax response missing data")
+	}
+	out := make([]store.Course, 0, len(item.Data.Courses))
+	for _, c := range item.Data.Courses {
+		if c.ID <= 0 {
+			continue
+		}
+		name := collapseWhitespace(c.Fullname)
+		if name == "" {
+			name = collapseWhitespace(c.Shortname)
+		}
+		if name == "" {
+			continue
+		}
+		out = append(out, store.Course{MoodleID: c.ID, Name: name})
+	}
+	return out, item.Data.NextOffset, nil
+}
+
 // parseCourseLinks scans HTML for links to course/view.php?id=N and returns one Course per
-// distinct id, in document order.
+// distinct id, in document order. Also accepts Moodle myoverview cards via data-course-id.
 func parseCourseLinks(html []byte) ([]store.Course, error) {
 	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(html))
 	if err != nil {
@@ -110,6 +276,7 @@ func parseCourseLinks(html []byte) ([]store.Course, error) {
 	}
 	seen := make(map[int]bool)
 	var out []store.Course
+
 	doc.Find(`a[href*="course/view.php"]`).Each(func(_ int, a *goquery.Selection) {
 		href, _ := a.Attr("href")
 		id, ok := courseViewIDFromHref(href)
@@ -123,7 +290,38 @@ func parseCourseLinks(html []byte) ([]store.Course, error) {
 		seen[id] = true
 		out = append(out, store.Course{MoodleID: id, Name: name})
 	})
+
+	// Card shells sometimes expose the id on the card even when the nested link text is empty.
+	doc.Find(`[data-course-id]`).Each(func(_ int, card *goquery.Selection) {
+		raw, _ := card.Attr("data-course-id")
+		v, err := strconv.ParseUint(raw, 10, 31)
+		if err != nil || v == 0 {
+			return
+		}
+		id := int(v)
+		if seen[id] {
+			return
+		}
+		name := courseCardName(card)
+		if name == "" {
+			return
+		}
+		seen[id] = true
+		out = append(out, store.Course{MoodleID: id, Name: name})
+	})
 	return out, nil
+}
+
+func courseCardName(card *goquery.Selection) string {
+	if t, ok := card.Find(`.coursename [title], .multiline[title], [title]`).First().Attr("title"); ok {
+		if name := collapseWhitespace(t); name != "" {
+			return name
+		}
+	}
+	if name := collapseWhitespace(card.Find(".visually-hidden, .sr-only").First().Text()); name != "" {
+		return name
+	}
+	return collapseWhitespace(card.Find(".coursename, .multiline").First().Text())
 }
 
 func courseViewIDFromHref(raw string) (int, bool) {

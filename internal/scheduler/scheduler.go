@@ -162,10 +162,11 @@ func (s *Scheduler) runCycle(ctx context.Context) {
 	s.scrapeGrades(cycleCtx, sc, courses)
 }
 
-// discoverCourses logs in, finds the live course list on the Moodle dashboard, and syncs it into
-// the DB: newly enrolled courses are added, and ones no longer visible (term ended, unenrolled)
-// are deleted along with their activities and grades. On failure it falls back to the last-known
-// DB rows so a transient Moodle hiccup does not stall the whole cycle.
+// discoverCourses logs in, finds Moodle's in-progress (active) enrolled courses, and syncs
+// that set into the DB: newly enrolled courses are added, and ones no longer in progress
+// (term ended, unenrolled) are deleted along with their activities and grades after a miss
+// streak. On failure it falls back to the last-known DB rows so a transient Moodle hiccup
+// does not stall the whole cycle.
 func (s *Scheduler) discoverCourses(ctx context.Context, sc *saia.SAIA) []store.Course {
 	discoverCtx, cancel := context.WithTimeout(ctx, discoveryDeadline)
 	defer cancel()
