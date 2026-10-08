@@ -13,7 +13,16 @@ import (
 )
 
 // ParsePDF extracts plain text from a PDF file's bytes.
-func ParsePDF(data []byte) (string, error) {
+func ParsePDF(data []byte) (text string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("parse pdf: %v", r)
+		}
+	}()
+	return parsePDFWithReader(data)
+}
+
+func parsePDFWithReader(data []byte) (string, error) {
 	r, err := pdf.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
 		return "", fmt.Errorf("open pdf: %w", err)
